@@ -25,7 +25,9 @@ tmp/
 
 ggml-metal-embed.metal
 ggml-metal-embed.metal.tmp
-
+ggml-large-v3-turbo.bin
+ggml-small.bin
+/graphify-out
 /main
 /stream
 /command
