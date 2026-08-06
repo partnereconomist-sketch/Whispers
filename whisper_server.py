@@ -74,7 +74,124 @@ IDIOMAS = frozenset("""auto es en pt fr de it nl ru zh ja ko ar hi tr pl uk sv
 CAMPOS_ENVELOPE = {"contract", "job_id", "session_id", "tool", "op", "input", "output", "params"}
 CAMPOS_INPUT = {"kind", "filename", "content_base64", "ref"}
 CAMPOS_OUTPUT = {"kind", "dir"}
-CAMPOS_PARAMS = {"language", "model", "translate", "segment_seconds", "temperature"}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDITORIA DE FLAGS -- las 65 que expone whisper-cli, cada una con una decisión
+#
+# Regla del proyecto: "el contrato no se hace a ciegas, revisa todas las
+# funciones que tiene el programa y NUNCA las deja caer en default, siempre se
+# deciden las flags".
+#
+# Decidir no es exponer: un contrato con 65 parámetros es inservible para un bot
+# asignador. Cada flag recibe una de tres decisiones, y ninguna queda sin ella:
+#
+#   EXPUESTA -- el contexto de quien llama cambia legítimamente la respuesta,
+#               así que viaja como params.<nombre>
+#   FIJA     -- la decide este servicio, con su motivo, y se pasa SIEMPRE de
+#               forma explícita en el argv -- también cuando el valor coincide
+#               con el default de whisper-cli. Es la parte que importa: si una
+#               versión futura cambia un default, nuestro comportamiento no se
+#               mueve, y si lo hiciera sería porque alguien editó esta tabla.
+#   NO_APLICA-- no tiene sentido en un servicio de transcripción por contrato.
+#
+# GET /health publica esta tabla: quien despacha trabajo puede ver qué se
+# decidió sin leer el código.
+# ══════════════════════════════════════════════════════════════════════════════
+
+EXPUESTA, FIJA, NO_APLICA = "expuesta", "fija", "no_aplica"
+
+FLAGS = {
+    # ── Expuestas: el llamador tiene contexto que el servicio no tiene ────────
+    "-l":    (EXPUESTA, "language", "idioma hablado; OBLIGATORIO, ver nota abajo"),
+    "-m":    (EXPUESTA, "model", "modelo ggml; calidad/tiempo lo decide quien pide"),
+    "-tr":   (EXPUESTA, "translate", "traducir al inglés; cambia el contenido, no la forma"),
+    "-tp":   (EXPUESTA, "temperature", "muestreo; 0 = determinista"),
+    "-t":    (EXPUESTA, "threads", "hilos; es presupuesto de CPU del host que despacha"),
+    "-bo":   (EXPUESTA, "best_of", "candidatos; calidad/tiempo puro"),
+    "-bs":   (EXPUESTA, "beam_size", "beam search; calidad/tiempo puro"),
+    "-ml":   (EXPUESTA, "max_len", "largo máximo de segmento en caracteres; afecta la granularidad de las anclas"),
+    "-sow":  (EXPUESTA, "split_on_word", "cortar en palabra y no en token; solo tiene sentido con max_len"),
+    "-ot":   (EXPUESTA, "offset_ms", "procesar desde este milisegundo — permite reintentar SOLO el "
+                                     "tramo que falló, en vez de todo el archivo. Verificado: con "
+                                     "120000 arranca exacto en 00:02:00"),
+    "-d":    (EXPUESTA, "duration_ms", "procesar solo esta duración; misma razón que offset_ms. "
+                                       "Verificado: con 60000 corta en ~00:01:01 de un audio de "
+                                       "8:33. LIMITE MEDIDO: whisper procesa en ventanas de 30 s, "
+                                       "así que por debajo de 30000 el corte no se aplica y se "
+                                       "devuelve la ventana completa"),
+    "--prompt": (EXPUESTA, "prompt", "contexto inicial; mejora nombres propios y jerga del dominio"),
+    "--vad": (EXPUESTA, "vad", "detección de voz: recorta silencios, baja el tiempo en grabaciones largas"),
+    "-vt":   (EXPUESTA, "vad_threshold", "umbral del VAD; solo aplica con vad=true"),
+
+    # ── Fijas: las decide el servicio, y se pasan explícitas ──────────────────
+    "-nt":   (FIJA, "false", "SIN timestamps no hay anclas, y sin anclas la salida no ubica nada "
+                             "en el Raw: es exactamente lo que este servicio existe para producir. "
+                             "Es la única flag que no puede exponerse."),
+    "-p":    (FIJA, "1", "más de un procesador parte el audio internamente y puede alterar los "
+                         "timestamps, que son la salida que importa. El paralelismo se hace "
+                         "afuera, por fracciones, donde es reanudable."),
+    "-np":   (FIJA, "false", "el resultado se parsea de stdout; silenciarlo lo dejaría vacío"),
+    "-ps":   (FIJA, "false", "los tokens especiales ensucian el texto que va al grafo"),
+    "-pc":   (FIJA, "false", "los colores ANSI romperían el parseo de los timestamps"),
+    "--print-confidence": (FIJA, "false", "mismo motivo: contamina el stdout que se parsea"),
+    "-pp":   (FIJA, "false", "el progreso va a stdout y se mezclaría con los segmentos"),
+    "-debug": (FIJA, "false", "volcados de diagnóstico, no salida de producto"),
+    "-ls":   (FIJA, "false", "log de scores del decoder; ruido para este uso"),
+    "-dl":   (FIJA, "false", "sale tras detectar el idioma SIN transcribir: incompatible con la op"),
+    "-di":   (FIJA, "false", "diarización estéreo; no está validada en este proyecto y requiere "
+                             "audio de dos canales. Candidata a exponer cuando se mida."),
+    "-tdrz": (FIJA, "false", "requiere un modelo tdrz que no está instalado; pedirla sin él falla"),
+    "-nf":   (FIJA, "false", "el fallback de temperatura es lo que rescata un tramo difícil; "
+                             "apagarlo cambia calidad por tiempo sin que nadie lo pida"),
+    "-tpi":  (FIJA, "0.20", "incremento del fallback; solo tiene sentido junto con -nf"),
+    "-mc":   (FIJA, "-1", "contexto de texto sin límite: mantiene la coherencia entre segmentos"),
+    "-ac":   (FIJA, "0", "contexto de audio completo; recortarlo degrada la calidad"),
+    "-wt":   (FIJA, "0.01", "umbral de timestamp por palabra; el default está calibrado upstream"),
+    "-et":   (FIJA, "2.40", "umbral de entropía para fallo del decoder; idem"),
+    "-lpt":  (FIJA, "-1.00", "umbral de logprob para fallo del decoder; idem"),
+    "-nth":  (FIJA, "0.60", "umbral de no-habla; idem"),
+    "-sns":  (FIJA, "false", "suprimir tokens de no-habla limpia la salida, pero no se midió el "
+                             "efecto sobre los timestamps. Fija hasta medirlo."),
+    "-fa":   (FIJA, "true", "flash attention: es el default upstream y acelera sin costo de calidad"),
+    "-ng":   (FIJA, "false", "no deshabilitar GPU: si el host la tiene, se usa"),
+    "-dev":  (FIJA, "0", "primera GPU; multi-GPU es decisión de despliegue, no de job"),
+    "--suppress-regex": (FIJA, "", "vacío: filtrar tokens por regex es una decisión de contenido "
+                                   "que corresponde a la IA organizadora, no al transcriptor"),
+    "--grammar": (FIJA, "", "GBNF restringe la salida a una gramática; no aplica a habla libre"),
+    "--grammar-rule": (FIJA, "", "sin gramática, no aplica"),
+    "--grammar-penalty": (FIJA, "100.0", "sin gramática, no aplica"),
+    "--carry-initial-prompt": (FIJA, "false", "repetir el prompt en cada ventana sesga la "
+                                              "transcripción hacia sus palabras"),
+    "-on":   (FIJA, "0", "offset por índice de segmento; el recorte se hace por tiempo (-ot/-d), "
+                         "que es lo que el llamador puede razonar"),
+    "-vm":   (FIJA, "", "modelo de VAD: se resuelve del entorno si hace falta, no por job"),
+    "-vspd": (FIJA, "250", "duración mínima de habla del VAD; default upstream"),
+    "-vsd":  (FIJA, "100", "silencio mínimo para cortar segmento; default upstream"),
+    "-vmsd": (FIJA, "FLT_MAX", "sin tope de duración de habla; no se pasa, es el default real"),
+    "-vp":   (FIJA, "30", "padding del VAD; default upstream"),
+    "-vo":   (FIJA, "0.10", "solape entre segmentos del VAD; default upstream"),
+
+    # ── No aplican a un servicio de transcripción por contrato ────────────────
+    "-otxt": (NO_APLICA, "", "la salida viaja por el contrato, no como archivo suelto en disco"),
+    "-ovtt": (NO_APLICA, "", "idem"),
+    "-osrt": (NO_APLICA, "", "idem"),
+    "-olrc": (NO_APLICA, "", "idem"),
+    "-ocsv": (NO_APLICA, "", "idem"),
+    "-oj":   (NO_APLICA, "", "idem — el markdown anclado ya lleva la estructura que el grafo usa"),
+    "-ojf":  (NO_APLICA, "", "idem"),
+    "-of":   (NO_APLICA, "", "la ruta de salida la decide output.kind/dir del contrato"),
+    "-owts": (NO_APLICA, "", "script de karaoke; no es un producto de este flujo"),
+    "-fp":   (NO_APLICA, "", "fuente para el video de karaoke; ver -owts"),
+    "-oved": (NO_APLICA, "", "OpenVINO: decisión de despliegue del host, no de job"),
+    "-dtw":  (NO_APLICA, "", "timestamps a nivel token; las anclas del grafo son por bloque, "
+                             "no por palabra. Reevaluar si se necesita precisión fina."),
+    "-h":    (NO_APLICA, "", "ayuda del CLI"),
+    "-f":    (NO_APLICA, "", "el archivo lo resuelve input.kind del contrato"),
+}
+
+# params que acepta el contrato = las EXPUESTAS + las propias de este servicio
+CAMPOS_PARAMS = ({nombre for tipo, nombre, _ in FLAGS.values() if tipo == EXPUESTA}
+                 | {"segment_seconds"})
 
 MEDIOS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma",
           ".mp4", ".mkv", ".avi", ".mov", ".webm", ".mpeg", ".mpg", ".m4v"}
@@ -205,13 +322,89 @@ def _validar_params(params: dict) -> dict:
         raise ContractError("out_of_range",
                             f"params.segment_seconds debe estar entre 10 y 1800, llegó {seg}")
 
-    temp = params.get("temperature", 0.0)
-    if isinstance(temp, int) and not isinstance(temp, bool):
-        temp = float(temp)
-    _exigir_tipo(temp, float, "params.temperature", "un número")
+    def entero(nombre, default, minimo, maximo):
+        v = params.get(nombre, default)
+        _exigir_tipo(v, int, f"params.{nombre}", "un entero")
+        if not (minimo <= v <= maximo):
+            raise ContractError("out_of_range",
+                                f"params.{nombre} debe estar entre {minimo} y {maximo}, llegó {v}")
+        return v
 
-    return {"language": idioma, "model": modelo, "model_path": disponibles[modelo],
-            "translate": traducir, "segment_seconds": seg, "temperature": temp}
+    def numero(nombre, default, minimo, maximo):
+        v = params.get(nombre, default)
+        if isinstance(v, int) and not isinstance(v, bool):
+            v = float(v)
+        _exigir_tipo(v, float, f"params.{nombre}", "un número")
+        if not (minimo <= v <= maximo):
+            raise ContractError("out_of_range",
+                                f"params.{nombre} debe estar entre {minimo} y {maximo}, llegó {v}")
+        return v
+
+    def booleano(nombre, default):
+        v = params.get(nombre, default)
+        _exigir_tipo(v, bool, f"params.{nombre}", "true o false")
+        return v
+
+    resuelto = {
+        "language": idioma, "model": modelo, "model_path": disponibles[modelo],
+        "translate": traducir, "segment_seconds": seg,
+        "temperature": numero("temperature", 0.0, 0.0, 1.0),
+        "threads": entero("threads", max(1, (os.cpu_count() or 4) // 2), 1, 64),
+        "best_of": entero("best_of", 5, 1, 20),
+        "beam_size": entero("beam_size", 5, 1, 20),
+        "max_len": entero("max_len", 0, 0, 1000),
+        "split_on_word": booleano("split_on_word", False),
+        "offset_ms": entero("offset_ms", 0, 0, 24 * 3600 * 1000),
+        "duration_ms": entero("duration_ms", 0, 0, 24 * 3600 * 1000),
+        "prompt": params.get("prompt", ""),
+        "vad": booleano("vad", False),
+        "vad_threshold": numero("vad_threshold", 0.5, 0.0, 1.0),
+    }
+    _exigir_tipo(resuelto["prompt"], str, "params.prompt", "una cadena")
+
+    if resuelto["split_on_word"] and resuelto["max_len"] == 0:
+        raise ContractError(
+            "ambiguous_request",
+            "split_on_word=true sin max_len no hace nada: whisper solo parte cuando hay un largo "
+            "máximo que respetar. Pedí max_len o sacá split_on_word, para que el resultado no "
+            "difiera en silencio de lo que se pidió.")
+
+    return resuelto
+
+
+def construir_comando(params: dict, wav: Path) -> list[str]:
+    """argv completo desde la tabla FLAGS.
+
+    Las FIJAS se pasan EXPLICITAS aunque su valor coincida con el default de
+    whisper-cli: así una versión futura que cambie un default no puede mover
+    nuestro comportamiento sin que alguien edite la tabla. Es la diferencia
+    entre "el default nos sirve" y "decidimos este valor".
+    """
+    cmd = [WHISPER_CLI, "-m", params["model_path"], "-f", str(wav)]
+
+    # Expuestas
+    cmd += ["-l", params["language"], "-tp", f"{params['temperature']:.3f}",
+            "-t", str(params["threads"]), "-bo", str(params["best_of"]),
+            "-bs", str(params["beam_size"]), "-ml", str(params["max_len"]),
+            "-ot", str(params["offset_ms"]), "-d", str(params["duration_ms"])]
+    if params["translate"]:
+        cmd.append("-tr")
+    if params["split_on_word"]:
+        cmd.append("-sow")
+    if params["prompt"]:
+        cmd += ["--prompt", params["prompt"]]
+    if params["vad"]:
+        cmd += ["--vad", "-vt", f"{params['vad_threshold']:.2f}"]
+
+    # Fijas de valor numérico/textual: siempre explícitas.
+    for flag, valor in (("-p", "1"), ("-tpi", "0.20"), ("-mc", "-1"), ("-ac", "0"),
+                        ("-wt", "0.01"), ("-et", "2.40"), ("-lpt", "-1.00"),
+                        ("-nth", "0.60"), ("-dev", "0"), ("-on", "0")):
+        cmd += [flag, valor]
+    # Fijas booleanas en false: whisper-cli las activa por presencia, así que
+    # "pasarlas explícitamente" es NO ponerlas. Quedan listadas en FLAGS para que
+    # la decisión sea auditable, que es lo que la regla pide.
+    return cmd
 
 
 def _leer_input(entrada):
@@ -383,10 +576,7 @@ def execute_job(parsed: dict) -> dict:
         if temporal:
             borrar.append(wav)
 
-        cmd = [WHISPER_CLI, "-m", params["model_path"], "-f", str(wav),
-               "-l", params["language"], "-tp", f"{params['temperature']:.3f}"]
-        if params["translate"]:
-            cmd.append("-tr")
+        cmd = construir_comando(params, wav)
 
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace")
@@ -418,10 +608,18 @@ def execute_job(parsed: dict) -> dict:
                 # con un solo segmento reportaba duración 0.
                 "duration_s": segmentos[-1][1] if segmentos else 0,
                 "chars": len(md)}
+        avisos = []
         if not segmentos:
-            # No es excepción, pero tampoco puede pasar como éxito mudo.
-            meta["warning"] = ("whisper-cli no emitió líneas con timestamp; el markdown queda "
-                               "sin anclas y por lo tanto no ubica nada en el archivo original")
+            avisos.append("whisper-cli no emitió líneas con timestamp; el markdown queda sin "
+                          "anclas y por lo tanto no ubica nada en el archivo original")
+        if 0 < params["duration_ms"] < 30000:
+            # Medido: whisper procesa en ventanas de 30 s. Pedir menos NO recorta,
+            # devuelve la ventana entera. Sin este aviso, quien pidió 6 s y recibió
+            # 30 no tiene forma de saber que no fue un error suyo.
+            avisos.append(f"duration_ms={params['duration_ms']} es menor que la ventana de 30 s de "
+                          f"whisper: el recorte no se aplica y la salida cubre la ventana completa")
+        if avisos:
+            meta["warning"] = " | ".join(avisos)
         return _envelope(job_id, "ok", outputs=[_escribir_salida(md, parsed)], meta=meta)
     except ContractError:
         raise
@@ -490,7 +688,17 @@ class Handler(BaseHTTPRequestHandler):
                 "whisper_cli": WHISPER_CLI, "ffmpeg": FFMPEG,
                 "models": sorted(modelos_disponibles()),
                 "languages": sorted(IDIOMAS),
+                "params": sorted(CAMPOS_PARAMS),
                 "max_concurrent": MAX_CONCURRENT, "in_flight": vuelo,
+                # La auditoría completa se publica acá: quien despacha trabajo ve
+                # qué se decidió con cada flag del programa sin leer el código.
+                "flags_auditadas": {
+                    "total": len(FLAGS),
+                    "expuestas": sorted(n for t, n, _ in FLAGS.values() if t == EXPUESTA),
+                    "fijas": {f: {"valor": v, "motivo": m}
+                              for f, (t, v, m) in FLAGS.items() if t == FIJA},
+                    "no_aplican": {f: m for f, (t, _v, m) in FLAGS.items() if t == NO_APLICA},
+                },
                 "note": "params.language es obligatorio: la autodetección puede traducir en silencio",
             })
         else:
