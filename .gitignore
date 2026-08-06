@@ -70,3 +70,7 @@ local.properties
 
 # AGENTS
 .pi/SYSTEM.md
+
+# Bytecode de Python (whisper_server.py / whisper_gui.py)
+__pycache__/
+*.pyc

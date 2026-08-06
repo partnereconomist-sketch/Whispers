@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+"""whisper_server.py — Whisper bajo el contrato de job estándar v1 (ADR-001, LADUM).
+
+POR QUE EXISTE
+  whisper.cpp acá vivía solo detrás de una GUI Tkinter (whisper_gui.py): un
+  humano elige archivo y aprieta un botón. Un bot asignador no puede despachar
+  contra eso. Este servidor expone la MISMA superficie que el Procesador --
+  POST /jobs con el envelope versionado, GET /health con la versión del
+  contrato -- para que quien reparte trabajo no tenga que saber que del otro
+  lado hay un .exe de C++ en vez de un pipeline de Python.
+
+QUE PRODUCE, Y POR QUE ASI
+  Markdown con ANCLAS DE TIEMPO, no un muro de texto. La salida de cada
+  programa del flujo se juzga por una sola pregunta: ¿le permite a graphify
+  construir un nodo que apunte de vuelta al Raw correcto? Un transcript plano
+  de 45 minutos da un nodo gigante que no ubica nada; en bloques anclados
+  (`<!-- t:720 ref:video.mp4#t720 -->`), graphify puede decir "esto se discute
+  en video.mp4 al minuto 12" y la IA salta ahí en vez de leer todo. Es el
+  patrón C del benchmark -- grafo para localizar, lectura selectiva después --
+  aplicado a medios, y el equivalente exacto de `archivo#p<pág>#r<n>` que el
+  Procesador usa para las regiones de un PDF.
+
+EL IDIOMA ES OBLIGATORIO, A PROPOSITO
+  La autodetección de Whisper falló en silencio en una prueba real de este
+  proyecto: tradujo un video entero al inglés sin un solo error visible
+  (brecha 4). Por eso `params.language` no tiene default -- hay que pedirlo, y
+  "auto" es una elección explícita que queda registrada en meta. Un fallo que
+  no se ve es peor que uno que rompe.
+
+USO
+  python whisper_server.py           # escucha en :8091 (WHISPER_PORT)
+  curl 127.0.0.1:8091/health
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse
+
+import base64
+
+DIR = Path(__file__).resolve().parent
+MODELS_DIR = DIR / "models"
+
+PORT = int(os.environ.get("WHISPER_PORT", "8091"))
+# 127.0.0.1 por defecto igual que el Procesador; la imagen Docker lo pone en
+# 0.0.0.0 (dentro de un contenedor, loopback es inalcanzable desde el host).
+HOST = os.environ.get("WHISPER_BIND_HOST", "127.0.0.1")
+
+CONTRACT_VERSION = "1.0"
+CONTRACT_MAJOR = CONTRACT_VERSION.split(".")[0]
+TOOL_NAME = "whisper"
+
+WORK_DIR = os.environ.get("WHISPER_WORK_DIR", "/work")
+MAX_BODY = 2 * 1024 * 1024 * 1024   # 2 GB: los videos pesan más que los PDF
+MAX_CONCURRENT = max(1, int(os.environ.get("WHISPER_MAX_CONCURRENT", "1")))
+_semaforo = threading.Semaphore(MAX_CONCURRENT)
+_in_flight = 0
+_in_flight_lock = threading.Lock()
+
+# Idiomas que acepta whisper.cpp (-l). "auto" es una elección explícita.
+IDIOMAS = frozenset("""auto es en pt fr de it nl ru zh ja ko ar hi tr pl uk sv
+    da fi no cs el he hu ro th vi id ms ca eu gl""".split())
+
+CAMPOS_ENVELOPE = {"contract", "job_id", "session_id", "tool", "op", "input", "output", "params"}
+CAMPOS_INPUT = {"kind", "filename", "content_base64", "ref"}
+CAMPOS_OUTPUT = {"kind", "dir"}
+CAMPOS_PARAMS = {"language", "model", "translate", "segment_seconds", "temperature"}
+
+MEDIOS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma",
+          ".mp4", ".mkv", ".avi", ".mov", ".webm", ".mpeg", ".mpg", ".m4v"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Descubrimiento del entorno
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _buscar_whisper_cli():
+    candidatos = [
+        DIR / "build" / "bin" / "Release" / "whisper-cli.exe",
+        DIR / "build" / "bin" / "whisper-cli.exe",
+        DIR / "build" / "bin" / "Debug" / "whisper-cli.exe",
+        DIR / "build" / "bin" / "whisper-cli",
+    ]
+    for c in candidatos:
+        if c.is_file():
+            return str(c)
+    import shutil
+    return shutil.which("whisper-cli")
+
+
+def _buscar_ffmpeg():
+    import shutil
+    return os.environ.get("FFMPEG_BIN") or shutil.which("ffmpeg")
+
+
+def modelos_disponibles() -> dict:
+    """Nombre corto -> ruta. Se lee del disco, no de una lista hardcodeada: pedir
+    un modelo que no está tiene que ser 400, no una sustitución silenciosa."""
+    if not MODELS_DIR.is_dir():
+        return {}
+    out = {}
+    for f in sorted(MODELS_DIR.glob("ggml-*.bin")):
+        if f.name.startswith("for-tests-"):
+            continue  # modelos de test del repo upstream: no sirven para transcribir
+        out[f.stem.replace("ggml-", "")] = str(f)
+    return out
+
+
+WHISPER_CLI = _buscar_whisper_cli()
+FFMPEG = _buscar_ffmpeg()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Contrato: validación estricta (mismo criterio que el Procesador)
+#
+# Un parámetro mal escrito no puede degradar en silencio a otro comportamiento.
+# Acá el caso grave es `language`: whisper.cpp con un idioma inválido no falla,
+# autodetecta -- y la autodetección ya tradujo un video entero al inglés sin
+# avisar en una prueba real de este proyecto.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ContractError(Exception):
+    def __init__(self, code, message, detail=None):
+        super().__init__(message)
+        self.code, self.message, self.detail = code, message, detail
+
+
+def _envelope(job_id, status, outputs=None, meta=None, error=None):
+    return {"contract": CONTRACT_VERSION, "job_id": job_id, "status": status,
+            "outputs": outputs or [], "meta": meta or {}, "error": error}
+
+
+def _sin_campos_extra(dic, permitidos, contexto):
+    extra = set(dic) - permitidos
+    if extra:
+        raise ContractError("unknown_field",
+                            f"campo(s) no reconocido(s) en {contexto}: {sorted(extra)}. "
+                            f"Permitidos: {sorted(permitidos)}")
+
+
+def _exigir_tipo(valor, tipo, camino, esperado):
+    malo = not isinstance(valor, tipo) or (tipo is int and isinstance(valor, bool))
+    if malo:
+        raise ContractError("wrong_type",
+                            f"{camino} debe ser {esperado}, llegó {type(valor).__name__} ({valor!r:.60})")
+    return valor
+
+
+def _validar_params(params: dict) -> dict:
+    _exigir_tipo(params, dict, "params", "un objeto")
+    _sin_campos_extra(params, CAMPOS_PARAMS, "params (op='transcribe')")
+
+    if "language" not in params:
+        raise ContractError(
+            "missing_fields",
+            "params.language es OBLIGATORIO y no tiene default. La autodetección de "
+            "Whisper falló en silencio en una prueba real de este proyecto (tradujo un "
+            f"video entero al inglés sin avisar). Elegí un idioma o pedí 'auto' de forma "
+            f"explícita. Válidos: {sorted(IDIOMAS)}")
+    idioma = _exigir_tipo(params["language"], str, "params.language", "una cadena")
+    if idioma not in IDIOMAS:
+        raise ContractError("unknown_language",
+                            f"language '{idioma}' no está en la lista del contrato. "
+                            f"whisper.cpp NO falla con un idioma inválido: autodetecta, así que "
+                            f"un typo acá se convierte en una transcripción en otro idioma. "
+                            f"Válidos: {sorted(IDIOMAS)}")
+
+    disponibles = modelos_disponibles()
+    modelo = params.get("model")
+    if modelo is None:
+        if not disponibles:
+            raise ContractError("no_model", f"No hay modelos ggml-*.bin en {MODELS_DIR}")
+        # El más grande de los presentes: más lento y más preciso, y es una
+        # elección reportada en meta, no invisible.
+        modelo = max(disponibles, key=lambda m: Path(disponibles[m]).stat().st_size)
+    else:
+        _exigir_tipo(modelo, str, "params.model", "una cadena")
+        if modelo not in disponibles:
+            raise ContractError("model_not_available",
+                                f"model '{modelo}' no está en este servidor. "
+                                f"Disponibles: {sorted(disponibles)}")
+
+    traducir = params.get("translate", False)
+    _exigir_tipo(traducir, bool, "params.translate", "true o false")
+    if traducir and idioma == "auto":
+        raise ContractError(
+            "ambiguous_request",
+            "translate=true con language='auto' es la combinación exacta que produjo el "
+            "fallo silencioso conocido: no se puede distinguir un video mal detectado de "
+            "uno traducido a propósito. Indicá el idioma de ORIGEN explícitamente.")
+
+    seg = params.get("segment_seconds", 120)
+    _exigir_tipo(seg, int, "params.segment_seconds", "un entero")
+    if not (10 <= seg <= 1800):
+        raise ContractError("out_of_range",
+                            f"params.segment_seconds debe estar entre 10 y 1800, llegó {seg}")
+
+    temp = params.get("temperature", 0.0)
+    if isinstance(temp, int) and not isinstance(temp, bool):
+        temp = float(temp)
+    _exigir_tipo(temp, float, "params.temperature", "un número")
+
+    return {"language": idioma, "model": modelo, "model_path": disponibles[modelo],
+            "translate": traducir, "segment_seconds": seg, "temperature": temp}
+
+
+def _leer_input(entrada):
+    if not isinstance(entrada, dict):
+        raise ContractError("missing_fields", "'input' es obligatorio y debe ser un objeto")
+    _sin_campos_extra(entrada, CAMPOS_INPUT, "input")
+    kind = entrada.get("kind", "inline")
+    filename = entrada.get("filename") or "media"
+
+    if kind == "inline":
+        b64 = entrada.get("content_base64")
+        if not b64:
+            raise ContractError("missing_fields", "input.content_base64 es obligatorio con kind='inline'")
+        try:
+            datos = base64.b64decode(b64, validate=True)
+        except Exception as e:
+            raise ContractError("invalid_base64", f"input.content_base64 no es base64 válido: {e}")
+    elif kind == "path":
+        ref = entrada.get("ref")
+        if not ref:
+            raise ContractError("missing_fields", "input.ref es obligatorio con kind='path'")
+        base = Path(WORK_DIR).resolve()
+        destino = (base / ref).resolve() if not os.path.isabs(ref) else Path(ref).resolve()
+        # Misma guarda anti path-traversal que el Procesador: sin esto un cliente
+        # podría pedir cualquier archivo del host.
+        if not str(destino).startswith(str(base)):
+            raise ContractError("path_outside_work_dir",
+                                f"input.ref resuelve fuera de WHISPER_WORK_DIR ({base})")
+        if not destino.is_file():
+            raise ContractError("input_not_found", f"input.ref no existe: {destino}")
+        datos, filename = destino.read_bytes(), destino.name
+    else:
+        raise ContractError("unsupported_input_kind",
+                            f"input.kind '{kind}' no soportado (usá 'inline' o 'path')")
+
+    ext = Path(filename).suffix.lower()
+    if ext and ext not in MEDIOS:
+        raise ContractError("unsupported_media",
+                            f"extensión '{ext}' no es audio/video reconocido. "
+                            f"Soportadas: {sorted(MEDIOS)}")
+    return datos, filename
+
+
+def parse_job(envelope: dict) -> dict:
+    if not isinstance(envelope, dict):
+        raise ContractError("invalid_envelope", "El body debe ser un objeto JSON")
+    _sin_campos_extra(envelope, CAMPOS_ENVELOPE, "el envelope")
+
+    contract = str(envelope.get("contract") or CONTRACT_VERSION)
+    if contract.split(".")[0] != CONTRACT_MAJOR:
+        raise ContractError("unsupported_contract",
+                            f"contract '{contract}' incompatible; este servidor habla {CONTRACT_VERSION}")
+
+    tool = envelope.get("tool", TOOL_NAME)
+    if tool != TOOL_NAME:
+        raise ContractError("wrong_tool", f"tool '{tool}' no es este servicio ('{TOOL_NAME}')")
+
+    op = envelope.get("op")
+    if op != "transcribe":
+        raise ContractError("unsupported_op", f"op '{op}' desconocida (este servicio solo hace 'transcribe')")
+
+    for campo, tipo, esperado in (("job_id", str, "una cadena"), ("session_id", str, "una cadena")):
+        if envelope.get(campo) is not None:
+            _exigir_tipo(envelope[campo], tipo, campo, esperado)
+
+    out_spec = envelope.get("output") or {}
+    _exigir_tipo(out_spec, dict, "output", "un objeto")
+    _sin_campos_extra(out_spec, CAMPOS_OUTPUT, "output")
+
+    params = _validar_params(envelope.get("params") or {})
+    datos, filename = _leer_input(envelope.get("input"))
+
+    return {"job_id": envelope.get("job_id") or uuid.uuid4().hex,
+            "session_id": envelope.get("session_id"), "params": params,
+            "out_spec": out_spec, "datos": datos, "filename": filename}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Transcripción
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Se capturan las DOS marcas de tiempo. Con solo la de inicio, la duración de un
+# audio de 11 s con un único segmento daba 0 -- el encabezado decía "00:00:00 de
+# audio" para un archivo con contenido, que es información falsa entrando al grafo.
+_LINEA = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})\.\d{3}\s*-->\s*(\d{2}):(\d{2}):(\d{2})\.\d{3}\]\s*(.*)")
+
+
+def _a_wav(origen: Path) -> tuple[Path, bool]:
+    """whisper-cli solo lee WAV 16 kHz mono. Devuelve (ruta, hay_que_borrarla)."""
+    if origen.suffix.lower() == ".wav":
+        return origen, False
+    if not FFMPEG:
+        raise ContractError("ffmpeg_missing",
+                            f"'{origen.suffix}' necesita ffmpeg para convertirse a WAV 16 kHz y "
+                            f"no se encontró ffmpeg (PATH o FFMPEG_BIN)")
+    destino = origen.with_suffix(".16k.wav")
+    r = subprocess.run([FFMPEG, "-y", "-i", str(origen), "-ar", "16000", "-ac", "1",
+                        "-c:a", "pcm_s16le", str(destino)], capture_output=True, text=True)
+    if r.returncode != 0 or not destino.is_file():
+        raise RuntimeError(f"ffmpeg falló ({r.returncode}): {r.stderr[-500:]}")
+    return destino, True
+
+
+def _segmentos(salida: str) -> list[tuple[int, int, str]]:
+    """(segundo_inicio, segundo_fin, texto) de cada línea con timestamp."""
+    out = []
+    for linea in salida.splitlines():
+        m = _LINEA.match(linea.strip())
+        if m:
+            h, mi, s, h2, mi2, s2, texto = m.groups()
+            if texto.strip():
+                out.append((int(h) * 3600 + int(mi) * 60 + int(s),
+                            int(h2) * 3600 + int(mi2) * 60 + int(s2),
+                            texto.strip()))
+    return out
+
+
+def _hhmmss(seg: int) -> str:
+    return f"{seg // 3600:02d}:{(seg % 3600) // 60:02d}:{seg % 60:02d}"
+
+
+def _a_markdown(segmentos, filename, params, meta_extra) -> str:
+    """Bloques anclados al tiempo. El ancla es lo que hace que un nodo del grafo
+    pueda apuntar al minuto exacto del Raw en vez de al archivo entero."""
+    stem = Path(filename).stem
+    dur = segmentos[-1][1] if segmentos else 0   # fin del último segmento, no su inicio
+    partes = [
+        f"# {filename} — transcripción", "",
+        f"> {_hhmmss(dur)} de audio · modelo `{params['model']}` · idioma `{params['language']}`"
+        + (" · TRADUCIDO al inglés" if params["translate"] else "")
+        + f" · {len(segmentos)} segmentos", "",
+        f"> Cada bloque está anclado a su momento: la referencia `{stem}#t<segundos>` "
+        f"ubica el pasaje en el archivo original.", "",
+    ]
+    if not segmentos:
+        partes += ["_(whisper no devolvió segmentos con timestamp para este archivo)_", ""]
+        return "\n".join(partes)
+
+    paso = params["segment_seconds"]
+    bloque_actual = -1
+    for seg, _fin, texto in segmentos:
+        bloque = seg // paso
+        if bloque != bloque_actual:
+            bloque_actual = bloque
+            inicio = bloque * paso
+            partes += ["", f"<!-- t:{inicio} ref:{stem}#t{inicio} -->",
+                       f"## {_hhmmss(inicio)}", ""]
+        partes.append(texto)
+    partes.append("")
+    return "\n".join(partes)
+
+
+def execute_job(parsed: dict) -> dict:
+    job_id, params = parsed["job_id"], parsed["params"]
+    t0 = time.perf_counter()
+
+    if not WHISPER_CLI:
+        return _envelope(job_id, "error", meta={"op": "transcribe"}, error={
+            "code": "whisper_cli_missing",
+            "message": f"No se encontró whisper-cli. Compilar whisper.cpp o poner el binario en PATH.",
+            "detail": None})
+
+    tmpdir = Path(tempfile.mkdtemp(prefix="whisper-job-"))
+    borrar = []
+    try:
+        origen = tmpdir / parsed["filename"]
+        origen.write_bytes(parsed["datos"])
+        wav, temporal = _a_wav(origen)
+        if temporal:
+            borrar.append(wav)
+
+        cmd = [WHISPER_CLI, "-m", params["model_path"], "-f", str(wav),
+               "-l", params["language"], "-tp", f"{params['temperature']:.3f}"]
+        if params["translate"]:
+            cmd.append("-tr")
+
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            # Un fallo con stderr VACIO no es lo mismo que uno con mensaje: significa
+            # que el proceso murió sin llegar a quejarse (aborto nativo, falta de
+            # memoria, DLL). Visto real el 2026-08-05: exit 0xc0e90002 sin una sola
+            # línea, y el MISMO comando funcionó al reintentar. Decirlo es lo que
+            # permite a quien llama distinguir "reintentá" de "esto no va a andar".
+            detalle = (r.stderr or "").strip()
+            if not detalle:
+                detalle = (f"whisper-cli murió sin escribir nada en stderr (exit "
+                           f"{r.returncode} = {r.returncode & 0xFFFFFFFF:#x}). Suele ser un aborto "
+                           f"nativo por recursos, no un error de argumentos: el mismo comando "
+                           f"puede funcionar al reintentar. Comando: {' '.join(cmd)}")
+            return _envelope(job_id, "error",
+                             meta={"op": "transcribe", "elapsed_s": round(time.perf_counter() - t0, 2),
+                                   "retryable": not (r.stderr or "").strip()},
+                             error={"code": "whisper_failed",
+                                    "message": f"whisper-cli salió con {r.returncode}",
+                                    "detail": detalle[-1200:]})
+
+        segmentos = _segmentos(r.stdout)
+        md = _a_markdown(segmentos, parsed["filename"], params, {})
+        meta = {"op": "transcribe", "elapsed_s": round(time.perf_counter() - t0, 2),
+                "language": params["language"], "model": params["model"],
+                "translated": params["translate"], "segments": len(segmentos),
+                # [1] = fin del último segmento. Con [0] (su inicio) un audio de 11 s
+                # con un solo segmento reportaba duración 0.
+                "duration_s": segmentos[-1][1] if segmentos else 0,
+                "chars": len(md)}
+        if not segmentos:
+            # No es excepción, pero tampoco puede pasar como éxito mudo.
+            meta["warning"] = ("whisper-cli no emitió líneas con timestamp; el markdown queda "
+                               "sin anclas y por lo tanto no ubica nada en el archivo original")
+        return _envelope(job_id, "ok", outputs=[_escribir_salida(md, parsed)], meta=meta)
+    except ContractError:
+        raise
+    except Exception as e:
+        return _envelope(job_id, "error",
+                         meta={"op": "transcribe", "elapsed_s": round(time.perf_counter() - t0, 2)},
+                         error={"code": "transcription_error", "message": str(e),
+                                "detail": traceback.format_exc()})
+    finally:
+        for f in borrar:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        try:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _escribir_salida(md: str, parsed: dict) -> dict:
+    spec = parsed["out_spec"]
+    if spec.get("kind") == "path":
+        base = Path(WORK_DIR).resolve()
+        destino_dir = Path(spec.get("dir") or base).resolve()
+        if not str(destino_dir).startswith(str(base)):
+            raise ContractError("path_outside_work_dir",
+                                f"output.dir resuelve fuera de WHISPER_WORK_DIR ({base})")
+        destino_dir.mkdir(parents=True, exist_ok=True)
+        destino = destino_dir / (Path(parsed["filename"]).stem + ".md")
+        destino.write_text(md, encoding="utf-8")
+        return {"kind": "markdown", "ref": str(destino)}
+    return {"kind": "markdown", "content": md}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Servidor
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+class Handler(BaseHTTPRequestHandler):
+
+    def log_message(self, *a):
+        pass
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if urlparse(self.path).path == "/health":
+            with _in_flight_lock:
+                vuelo = _in_flight
+            self.send_json({
+                "status": "ok", "contract": CONTRACT_VERSION, "tool": TOOL_NAME,
+                "ops": ["transcribe"], "work_dir": WORK_DIR,
+                "whisper_cli": WHISPER_CLI, "ffmpeg": FFMPEG,
+                "models": sorted(modelos_disponibles()),
+                "languages": sorted(IDIOMAS),
+                "max_concurrent": MAX_CONCURRENT, "in_flight": vuelo,
+                "note": "params.language es obligatorio: la autodetección puede traducir en silencio",
+            })
+        else:
+            self.send_json({"error": "not_found"}, 404)
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/jobs":
+            self.send_json(_envelope(None, "error", error={
+                "code": "not_found", "message": "El único endpoint de trabajo es POST /jobs"}), 404)
+            return
+        job_id = None
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0:
+                raise ContractError("empty_body", "El body está vacío")
+            if n > MAX_BODY:
+                raise ContractError("body_too_large", f"El body supera el máximo de {MAX_BODY // (1024**3)} GB")
+            try:
+                envelope = json.loads(self.rfile.read(n))
+            except json.JSONDecodeError as e:
+                raise ContractError("invalid_json", f"El body no es JSON válido: {e}")
+            job_id = envelope.get("job_id") if isinstance(envelope, dict) else None
+
+            parsed = parse_job(envelope)
+            global _in_flight
+            with _semaforo:
+                with _in_flight_lock:
+                    _in_flight += 1
+                try:
+                    self.send_json(execute_job(parsed), 200)
+                finally:
+                    with _in_flight_lock:
+                        _in_flight -= 1
+        except ContractError as e:
+            self.send_json(_envelope(job_id, "error", error={
+                "code": e.code, "message": e.message, "detail": e.detail}), 400)
+        except Exception as e:
+            self.send_json(_envelope(job_id, "error", error={
+                "code": "internal_error", "message": str(e),
+                "detail": traceback.format_exc()}), 500)
+
+
+if __name__ == "__main__":
+    modelos = modelos_disponibles()
+    print(f"\n  Whisper Server — http://{HOST}:{PORT}")
+    print(f"  Contrato: v{CONTRACT_VERSION} (tool=\"{TOOL_NAME}\", op=transcribe, work_dir={WORK_DIR})")
+    print(f"  whisper-cli: {WHISPER_CLI or 'NO ENCONTRADO — compilar whisper.cpp'}")
+    print(f"  ffmpeg:      {FFMPEG or 'NO ENCONTRADO — solo se podrán procesar .wav 16kHz'}")
+    print(f"  Modelos:     {', '.join(sorted(modelos)) or 'NINGUNO en ' + str(MODELS_DIR)}")
+    print(f"  Endpoints:   GET /health   POST /jobs")
+    print(f"  Concurrencia: {MAX_CONCURRENT}")
+    print(f"  params.language es OBLIGATORIO (la autodetección puede traducir en silencio)\n")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
