@@ -74,3 +74,6 @@ local.properties
 # Bytecode de Python (whisper_server.py / whisper_gui.py)
 __pycache__/
 *.pyc
+
+# Claves de API: se guarda el hash, pero el archivo no se versiona igual
+.auth/

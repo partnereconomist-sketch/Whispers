@@ -51,6 +51,12 @@ import base64
 DIR = Path(__file__).resolve().parent
 MODELS_DIR = DIR / "models"
 
+try:
+    import auth
+except Exception as _e:   # sin auth.py el servidor arranca igual, sin autenticación
+    auth = None
+    print(f"  AVISO: auth.py no disponible ({type(_e).__name__}); la autenticación queda apagada")
+
 PORT = int(os.environ.get("WHISPER_PORT", "8091"))
 # 127.0.0.1 por defecto igual que el Procesador; la imagen Docker lo pone en
 # 0.0.0.0 (dentro de un contenedor, loopback es inalcanzable desde el host).
@@ -705,6 +711,13 @@ class Handler(BaseHTTPRequestHandler):
                 "models": sorted(modelos_disponibles()),
                 "languages": sorted(IDIOMAS),
                 "params": sorted(CAMPOS_PARAMS),
+                # /health ABIERTO a propósito: un orquestador tiene que poder
+                # preguntar si hace falta credencial ANTES de mandar una.
+                "auth": {
+                    "requerida": bool(auth and auth.requerida()),
+                    "transporte": "cabecera Authorization: Bearer <clave>",
+                    "clientes": len(auth.listar()) if auth else 0,
+                },
                 "max_concurrent": MAX_CONCURRENT, "in_flight": vuelo,
                 # La auditoría completa se publica acá: quien despacha trabajo ve
                 # qué se decidió con cada flag del programa sin leer el código.
@@ -725,6 +738,33 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(_envelope(None, "error", error={
                 "code": "not_found", "message": "El único endpoint de trabajo es POST /jobs"}), 404)
             return
+        # Autenticación por CABECERA, no en el envelope: el envelope viaja por
+        # logs y reintentos, y ahí la credencial quedaría expuesta. Apagada
+        # mientras no haya clientes registrados (ver auth.py).
+        if auth is not None:
+            ok, motivo = auth.verificar(self.headers.get("Authorization"))
+            if not ok:
+                # DRENAR EL BODY ANTES DE RESPONDER. Sin esto el cliente, que
+                # todavía está escribiendo (un video son cientos de MB), recibe un
+                # error de red en vez del 401 -- medido en el Procesador con un PDF
+                # de 320 KB: WinError 10053. Un rechazo que llega como conexión
+                # abortada manda a revisar el lugar equivocado.
+                try:
+                    pendiente = int(self.headers.get("Content-Length", 0) or 0)
+                    while pendiente > 0:
+                        trozo = self.rfile.read(min(pendiente, 65536))
+                        if not trozo:
+                            break
+                        pendiente -= len(trozo)
+                except Exception:
+                    pass
+                self.send_json(_envelope(None, "error", error={
+                    "code": "unauthorized", "message": motivo,
+                    "detail": "Formato: Authorization: Bearer <clave>. "
+                              "Registrar un cliente: python auth.py add \"<nombre>\"",
+                }), 401)
+                return
+
         job_id = None
         try:
             n = int(self.headers.get("Content-Length") or 0)
