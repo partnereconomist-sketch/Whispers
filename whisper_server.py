@@ -407,6 +407,34 @@ def construir_comando(params: dict, wav: Path) -> list[str]:
     return cmd
 
 
+def resolver_en_work_dir(ref: str, campo: str) -> Path:
+    """Resuelve un ref contra WHISPER_WORK_DIR y rechaza lo que caiga fuera.
+
+    Compara por ANCESTROS (`base in target.parents`), no por prefijo de texto.
+    La primera versión de este servidor usaba `str(destino).startswith(str(base))`
+    con un comentario que afirmaba replicar la guarda del Procesador -- no la
+    replicaba, y dejaba un agujero real: con WORK_DIR=/data/work, el ref
+    "../work_evil/secret.txt" resuelve a /data/work_evil/secret.txt, que empieza
+    con los mismos caracteres y por lo tanto pasaba. No hacía falta ni un symlink
+    ni salir a un directorio inexistente: bastaba un hermano cuyo nombre empiece
+    igual. Lo encontró la rutina evaluativa nocturna del 2026-08-07.
+
+    `resolve()` va ANTES de comparar, para que '..' y symlinks queden resueltos.
+    """
+    if not ref:
+        raise ContractError("missing_fields", f"{campo} es obligatorio")
+    base = Path(WORK_DIR).resolve()
+    destino = Path(ref)
+    if not destino.is_absolute():
+        destino = base / destino
+    destino = destino.resolve()
+    if destino != base and base not in destino.parents:
+        raise ContractError("path_outside_work_dir",
+                            f"{campo} debe estar dentro de {base} (WHISPER_WORK_DIR); "
+                            f"recibido: {ref}")
+    return destino
+
+
 def _leer_input(entrada):
     if not isinstance(entrada, dict):
         raise ContractError("missing_fields", "'input' es obligatorio y debe ser un objeto")
@@ -423,16 +451,7 @@ def _leer_input(entrada):
         except Exception as e:
             raise ContractError("invalid_base64", f"input.content_base64 no es base64 válido: {e}")
     elif kind == "path":
-        ref = entrada.get("ref")
-        if not ref:
-            raise ContractError("missing_fields", "input.ref es obligatorio con kind='path'")
-        base = Path(WORK_DIR).resolve()
-        destino = (base / ref).resolve() if not os.path.isabs(ref) else Path(ref).resolve()
-        # Misma guarda anti path-traversal que el Procesador: sin esto un cliente
-        # podría pedir cualquier archivo del host.
-        if not str(destino).startswith(str(base)):
-            raise ContractError("path_outside_work_dir",
-                                f"input.ref resuelve fuera de WHISPER_WORK_DIR ({base})")
+        destino = resolver_en_work_dir(entrada.get("ref"), "input.ref")
         if not destino.is_file():
             raise ContractError("input_not_found", f"input.ref no existe: {destino}")
         datos, filename = destino.read_bytes(), destino.name
@@ -644,11 +663,8 @@ def execute_job(parsed: dict) -> dict:
 def _escribir_salida(md: str, parsed: dict) -> dict:
     spec = parsed["out_spec"]
     if spec.get("kind") == "path":
-        base = Path(WORK_DIR).resolve()
-        destino_dir = Path(spec.get("dir") or base).resolve()
-        if not str(destino_dir).startswith(str(base)):
-            raise ContractError("path_outside_work_dir",
-                                f"output.dir resuelve fuera de WHISPER_WORK_DIR ({base})")
+        destino_dir = resolver_en_work_dir(spec.get("dir") or str(Path(WORK_DIR).resolve()),
+                                           "output.dir")
         destino_dir.mkdir(parents=True, exist_ok=True)
         destino = destino_dir / (Path(parsed["filename"]).stem + ".md")
         destino.write_text(md, encoding="utf-8")
