@@ -77,7 +77,8 @@ _in_flight_lock = threading.Lock()
 IDIOMAS = frozenset("""auto es en pt fr de it nl ru zh ja ko ar hi tr pl uk sv
     da fi no cs el he hu ro th vi id ms ca eu gl""".split())
 
-CAMPOS_ENVELOPE = {"contract", "job_id", "session_id", "tool", "op", "input", "output", "params"}
+CAMPOS_ENVELOPE = {"contract", "job_id", "session_id", "tool", "op", "input", "output", "params",
+                   "on_behalf_of"}
 CAMPOS_INPUT = {"kind", "filename", "content_base64", "ref"}
 CAMPOS_OUTPUT = {"kind", "dir"}
 
@@ -170,7 +171,10 @@ FLAGS = {
                                               "transcripción hacia sus palabras"),
     "-on":   (FIJA, "0", "offset por índice de segmento; el recorte se hace por tiempo (-ot/-d), "
                          "que es lo que el llamador puede razonar"),
-    "-vm":   (FIJA, "", "modelo de VAD: se resuelve del entorno si hace falta, no por job"),
+    "-vm":   (FIJA, "<el silero que haya en models/>", "modelo de VAD: lo elige el servicio, no el "
+                                                       "job, pero se pasa EXPLICITO. Dejarlo al "
+                                                       "default hacía que --vad sin modelo matara "
+                                                       "el proceso con exit 10 a mitad del trabajo"),
     "-vspd": (FIJA, "250", "duración mínima de habla del VAD; default upstream"),
     "-vsd":  (FIJA, "100", "silencio mínimo para cortar segmento; default upstream"),
     "-vmsd": (FIJA, "FLT_MAX", "sin tope de duración de habla; no se pasa, es el default real"),
@@ -237,6 +241,27 @@ def modelos_disponibles() -> dict:
             continue  # modelos de test del repo upstream: no sirven para transcribir
         out[f.stem.replace("ggml-", "")] = str(f)
     return out
+
+
+def modelo_vad():
+    """Ruta del modelo VAD (silero), o None si no está descargado.
+
+    `--vad` SIN modelo no da un error de parámetros: whisper-cli arranca, carga
+    el modelo de transcripción, convierte el audio, y recién ahí muere con
+    exit 10 -- después de haber pagado todo el costo. Medido el 2026-08-08
+    despachando un clip real: 1.7 s de trabajo tirados y un `whisper_failed`
+    genérico que no decía que faltaba un modelo. Pedir VAD sin tenerlo tiene que
+    ser 400 con el motivo, igual que pedir un `model` que no está.
+
+    Los `for-tests-*` del repo upstream se excluyen por la misma razón que en
+    modelos_disponibles(): no sirven para trabajo real.
+    """
+    if not MODELS_DIR.is_dir():
+        return None
+    for f in sorted(MODELS_DIR.glob("*silero*.bin")):
+        if not f.name.startswith("for-tests-"):
+            return str(f)
+    return None
 
 
 WHISPER_CLI = _buscar_whisper_cli()
@@ -368,6 +393,14 @@ def _validar_params(params: dict) -> dict:
     }
     _exigir_tipo(resuelto["prompt"], str, "params.prompt", "una cadena")
 
+    if resuelto["vad"] and not modelo_vad():
+        raise ContractError(
+            "vad_model_missing",
+            "params.vad=true necesita el modelo VAD (silero) y no está descargado en "
+            f"{MODELS_DIR}. Sin él whisper-cli no rechaza el pedido: muere a mitad del "
+            "trabajo con exit 10, después de convertir el audio y cargar el modelo. "
+            "Descargalo con models/download-vad-model.sh (o .cmd), o pedí vad=false.")
+
     if resuelto["split_on_word"] and resuelto["max_len"] == 0:
         raise ContractError(
             "ambiguous_request",
@@ -400,7 +433,11 @@ def construir_comando(params: dict, wav: Path) -> list[str]:
     if params["prompt"]:
         cmd += ["--prompt", params["prompt"]]
     if params["vad"]:
-        cmd += ["--vad", "-vt", f"{params['vad_threshold']:.2f}"]
+        # -vm EXPLICITO: _validar_params ya garantizó que existe. Antes se
+        # omitía ("se resuelve del entorno si hace falta"), que es justo la clase
+        # de default heredado que §Funciones prohíbe -- y acá el default heredado
+        # era "no hay modelo", así que el job moría después de hacer el trabajo.
+        cmd += ["--vad", "-vm", modelo_vad(), "-vt", f"{params['vad_threshold']:.2f}"]
 
     # Fijas de valor numérico/textual: siempre explícitas.
     for flag, valor in (("-p", "1"), ("-tpi", "0.20"), ("-mc", "-1"), ("-ac", "0"),
@@ -413,8 +450,60 @@ def construir_comando(params: dict, wav: Path) -> list[str]:
     return cmd
 
 
-def resolver_en_work_dir(ref: str, campo: str) -> Path:
-    """Resuelve un ref contra WHISPER_WORK_DIR y rechaza lo que caiga fuera.
+# ══════════════════════════════════════════════════════════════════════════════
+# AISLAMIENTO POR USUARIO Y SESION dentro del volumen compartido
+#
+# Estructura (filosofía §Volumen común):  <WORK_DIR>/<usuario>/<sesión>/
+#
+# LLEGO TARDE, Y VALE LA PENA DECIR POR QUE. El 2026-08-08 el Procesador y
+# Synapse pasaron a resolver dentro de <usuario>/<sesión>; este servidor quedó
+# resolviendo contra la RAIZ del volumen, y se registró igual como "aislamiento
+# ✅". Con un solo inquilino los dos se comportan igual, así que nada lo delató:
+# la guarda impedía salir del volumen, no impedía que un job nombrara el archivo
+# de otro usuario dentro de él. Lo destapó el primer cliente que despachaba a los
+# tres programas con una identidad de usuario -- el bot asignador -- al recibir
+# `unknown_field: on_behalf_of`, un campo que los otros dos aceptaban hacía días.
+#
+# _segmento_seguro es DELIBERADAMENTE idéntico al de extractor.py,
+# routes_contract.py y asignador.py: los cuatro tienen que calcular el MISMO
+# nombre de carpeta o el que escribe y el que lee no coinciden.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SEGMENTO_INVALIDO = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _segmento_seguro(valor, defecto: str) -> str:
+    limpio = _SEGMENTO_INVALIDO.sub("_", str(valor or "").strip())[:64]
+    return limpio if limpio and limpio.strip(".") else defecto
+
+
+def base_de_sesion(session_id=None, cliente=None, on_behalf_of=None) -> Path:
+    """Directorio raíz de ESTE usuario y ESTA sesión. Se crea si no existe.
+
+    El usuario sale de la CREDENCIAL, no del envelope: un cliente no puede
+    declararse otro, sólo demostrarlo con su clave. La excepción es un cliente
+    con scope 'service' (el bot asignador), que sí declara por quién actúa --y
+    los programas lo aceptan porque el SERVICIO está autenticado, no porque
+    confíen en una cabecera suelta.
+    """
+    if auth is not None:
+        try:
+            crudo = auth.usuario_efectivo(cliente, on_behalf_of)
+        except PermissionError as e:
+            raise ContractError("forbidden_impersonation", str(e))
+    else:
+        crudo = (cliente or {}).get("nombre") if cliente else None
+    base = (Path(WORK_DIR) / _segmento_seguro(crudo, "local")
+            / _segmento_seguro(session_id, "sin-sesion")).resolve()
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass   # si no se puede crear, la validación de abajo da el error real
+    return base
+
+
+def resolver_en_work_dir(ref: str, campo: str, base: Path) -> Path:
+    """Resuelve un ref DENTRO del directorio de la sesión y rechaza lo de afuera.
 
     Compara por ANCESTROS (`base in target.parents`), no por prefijo de texto.
     La primera versión de este servidor usaba `str(destino).startswith(str(base))`
@@ -429,19 +518,18 @@ def resolver_en_work_dir(ref: str, campo: str) -> Path:
     """
     if not ref:
         raise ContractError("missing_fields", f"{campo} es obligatorio")
-    base = Path(WORK_DIR).resolve()
     destino = Path(ref)
     if not destino.is_absolute():
         destino = base / destino
     destino = destino.resolve()
     if destino != base and base not in destino.parents:
         raise ContractError("path_outside_work_dir",
-                            f"{campo} debe estar dentro de {base} (WHISPER_WORK_DIR); "
+                            f"{campo} debe estar dentro de {base} (su usuario y sesión); "
                             f"recibido: {ref}")
     return destino
 
 
-def _leer_input(entrada):
+def _leer_input(entrada, base: Path):
     if not isinstance(entrada, dict):
         raise ContractError("missing_fields", "'input' es obligatorio y debe ser un objeto")
     _sin_campos_extra(entrada, CAMPOS_INPUT, "input")
@@ -457,7 +545,7 @@ def _leer_input(entrada):
         except Exception as e:
             raise ContractError("invalid_base64", f"input.content_base64 no es base64 válido: {e}")
     elif kind == "path":
-        destino = resolver_en_work_dir(entrada.get("ref"), "input.ref")
+        destino = resolver_en_work_dir(entrada.get("ref"), "input.ref", base)
         if not destino.is_file():
             raise ContractError("input_not_found", f"input.ref no existe: {destino}")
         datos, filename = destino.read_bytes(), destino.name
@@ -473,7 +561,7 @@ def _leer_input(entrada):
     return datos, filename
 
 
-def parse_job(envelope: dict) -> dict:
+def parse_job(envelope: dict, cliente=None) -> dict:
     if not isinstance(envelope, dict):
         raise ContractError("invalid_envelope", "El body debe ser un objeto JSON")
     _sin_campos_extra(envelope, CAMPOS_ENVELOPE, "el envelope")
@@ -491,7 +579,8 @@ def parse_job(envelope: dict) -> dict:
     if op != "transcribe":
         raise ContractError("unsupported_op", f"op '{op}' desconocida (este servicio solo hace 'transcribe')")
 
-    for campo, tipo, esperado in (("job_id", str, "una cadena"), ("session_id", str, "una cadena")):
+    for campo, tipo, esperado in (("job_id", str, "una cadena"), ("session_id", str, "una cadena"),
+                                  ("on_behalf_of", str, "una cadena")):
         if envelope.get(campo) is not None:
             _exigir_tipo(envelope[campo], tipo, campo, esperado)
 
@@ -499,12 +588,13 @@ def parse_job(envelope: dict) -> dict:
     _exigir_tipo(out_spec, dict, "output", "un objeto")
     _sin_campos_extra(out_spec, CAMPOS_OUTPUT, "output")
 
+    base = base_de_sesion(envelope.get("session_id"), cliente, envelope.get("on_behalf_of"))
     params = _validar_params(envelope.get("params") or {})
-    datos, filename = _leer_input(envelope.get("input"))
+    datos, filename = _leer_input(envelope.get("input"), base)
 
     return {"job_id": envelope.get("job_id") or uuid.uuid4().hex,
             "session_id": envelope.get("session_id"), "params": params,
-            "out_spec": out_spec, "datos": datos, "filename": filename}
+            "out_spec": out_spec, "datos": datos, "filename": filename, "base": base}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -669,8 +759,11 @@ def execute_job(parsed: dict) -> dict:
 def _escribir_salida(md: str, parsed: dict) -> dict:
     spec = parsed["out_spec"]
     if spec.get("kind") == "path":
-        destino_dir = resolver_en_work_dir(spec.get("dir") or str(Path(WORK_DIR).resolve()),
-                                           "output.dir")
+        # La salida se escribe DENTRO del directorio de la sesión, igual que la
+        # entrada: si output.dir se resolviera contra la raíz del volumen, un job
+        # podría dejarle archivos a otro usuario en su carpeta.
+        destino_dir = resolver_en_work_dir(spec.get("dir") or str(parsed["base"]),
+                                           "output.dir", parsed["base"])
         destino_dir.mkdir(parents=True, exist_ok=True)
         destino = destino_dir / (Path(parsed["filename"]).stem + ".md")
         destino.write_text(md, encoding="utf-8")
@@ -707,6 +800,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "status": "ok", "contract": CONTRACT_VERSION, "tool": TOOL_NAME,
                 "ops": ["transcribe"], "work_dir": WORK_DIR,
+                # Publicado para que quien despacha decida `vad` CHEQUEANDO en
+                # vez de suponer: sin modelo, --vad muere a mitad del trabajo.
+                "vad": {"disponible": bool(modelo_vad()), "modelo": modelo_vad()},
                 "whisper_cli": WHISPER_CLI, "ffmpeg": FFMPEG,
                 "models": sorted(modelos_disponibles()),
                 "languages": sorted(IDIOMAS),
@@ -741,8 +837,14 @@ class Handler(BaseHTTPRequestHandler):
         # Autenticación por CABECERA, no en el envelope: el envelope viaja por
         # logs y reintentos, y ahí la credencial quedaría expuesta. Apagada
         # mientras no haya clientes registrados (ver auth.py).
+        cliente = None
         if auth is not None:
             ok, motivo = auth.verificar(self.headers.get("Authorization"))
+            if ok:
+                # El cliente autenticado define el USUARIO del directorio de
+                # trabajo. Antes se descartaba, y por eso este servidor resolvía
+                # todo contra la raíz del volumen (ver §AISLAMIENTO).
+                cliente = motivo if isinstance(motivo, dict) else None
             if not ok:
                 # DRENAR EL BODY ANTES DE RESPONDER. Sin esto el cliente, que
                 # todavía está escribiendo (un video son cientos de MB), recibe un
@@ -778,7 +880,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ContractError("invalid_json", f"El body no es JSON válido: {e}")
             job_id = envelope.get("job_id") if isinstance(envelope, dict) else None
 
-            parsed = parse_job(envelope)
+            parsed = parse_job(envelope, cliente)
             global _in_flight
             with _semaforo:
                 with _in_flight_lock:
