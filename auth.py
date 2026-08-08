@@ -22,15 +22,14 @@ VA EN CABECERA, NO EN EL ENVELOPE
   contrato de job no cambia de versión por esto.
 
 MODELO
-  Mismo que PartnerClaudeProcesadorInformacion/auth.py y que
-  cerebro-mcp/auth.mjs, ya construidos y validados: se guarda el SHA-256
+  Mismo que cerebro-mcp/auth.mjs, ya construido y validado: se guarda el SHA-256
   de la clave, nunca la clave; cada cliente tiene nombre y scope; la comparación
   es de tiempo constante. Se duplica en vez de compartirse porque el ADR-001
   prohíbe que un programa importe código de otro -- son contenedores
   independientes.
 
 USO
-  python auth.py add "bot-asignador" [--scope full|read]
+  python auth.py add "bot-asignador" [--scope full|read|service]
   python auth.py list
   python auth.py revoke "bot-asignador"
 """
@@ -44,12 +43,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 DIR = Path(__file__).resolve().parent
-AUTH_FILE = Path(os.environ.get('WHISPER_AUTH_FILE') or (DIR / '.auth' / 'clients.json'))
 
-# Un scope 'read' solo puede consultar; las ops que producen trabajo exigen 'full'.
-# El tope es por OPERACION del contrato, no por endpoint: /jobs es uno solo.
-OPS_SOLO_LECTURA = frozenset()   # 'transcribe' produce trabajo: no es de solo lectura
-PREFIJO_CLAVE = 'whis_'
+# REGISTRO COMPARTIDO por los tres programas del flujo. Antes cada uno tenía el
+# suyo: dar de alta un cliente eran tres operaciones y revocarlo también, así que
+# una revocación olvidada dejaba una puerta abierta sin que nadie lo notara.
+# LADUM_AUTH_FILE apunta a un único archivo alcanzable por todos; si no está, se
+# cae al archivo propio del programa (desarrollo aislado).
+AUTH_FILE = Path(os.environ.get('LADUM_AUTH_FILE')
+                 or os.environ.get('WHISPER_AUTH_FILE')
+                 or (DIR / '.auth' / 'clients.json'))
+
+# SCOPES
+#   read    -- solo consultar (hoy ninguna op del contrato lo es; queda declarado)
+#   full    -- puede pedir trabajo, actuando SIEMPRE como sí mismo
+#   service -- además puede declarar EN NOMBRE DE QUIEN trabaja (`on_behalf_of`).
+#              Es lo que va a necesitar el bot asignador: recibe el pedido de un
+#              usuario y despacha a los programas por él. Los programas lo aceptan
+#              porque el SERVICIO está autenticado, no porque confíen en una
+#              cabecera suelta. Un cliente 'full' que mande on_behalf_of recibe un
+#              error, no un silencio.
+SCOPES = ('read', 'full', 'service')
+# El tope por scope es por OPERACION del contrato, no por endpoint: /jobs es uno solo.
+OPS_SOLO_LECTURA = frozenset()
+# Prefijo común: la clave sirve para los tres programas, así que no lleva el
+# nombre de ninguno.
+PREFIJO_CLAVE = 'ladum_'
 
 
 def _hash(clave: str) -> str:
@@ -81,8 +99,8 @@ def requerida() -> bool:
 
 
 def agregar(nombre: str, scope: str = 'full') -> str:
-    if scope not in ('full', 'read'):
-        raise ValueError(f"scope inválido '{scope}' — usar 'full' o 'read'")
+    if scope not in SCOPES:
+        raise ValueError(f"scope inválido '{scope}' — usar uno de {SCOPES}")
     clave = PREFIJO_CLAVE + secrets.token_hex(24)
     clientes = _cargar()
     clientes[_hash(clave)] = {'nombre': nombre, 'scope': scope,
@@ -129,6 +147,30 @@ def verificar(cabecera: str | None, op: str | None = None):
     return False, 'clave desconocida o revocada'
 
 
+def usuario_efectivo(cliente, on_behalf_of=None) -> str:
+    """De quién es el directorio de trabajo de este job.
+
+    Sin autenticación es 'local'. Con ella, el usuario sale de la CREDENCIAL y no
+    del envelope -- salvo que quien llama sea un `service`, que sí puede declarar
+    por quién actúa. Un cliente que no es service y manda `on_behalf_of` recibe un
+    error: si se ignorara en silencio, su trabajo terminaría en un directorio
+    distinto del que pidió y nadie sabría por qué.
+    """
+    if cliente is None:
+        if on_behalf_of:
+            raise PermissionError(
+                'on_behalf_of requiere un cliente autenticado con scope="service"; '
+                'con la autenticación apagada no hay forma de verificar quién lo pide')
+        return 'local'
+    if on_behalf_of:
+        if cliente.get('scope') != 'service':
+            raise PermissionError(
+                f"el cliente '{cliente.get('nombre')}' tiene scope '{cliente.get('scope')}' y "
+                f"no puede actuar en nombre de otro; hace falta scope='service'")
+        return str(on_behalf_of)
+    return str(cliente.get('nombre') or 'local')
+
+
 def _cli(argv) -> int:
     if not argv or argv[0] in ('-h', '--help'):
         print(__doc__)
@@ -136,7 +178,7 @@ def _cli(argv) -> int:
     cmd = argv[0]
     if cmd == 'add':
         if len(argv) < 2:
-            print('uso: auth.py add "<nombre>" [--scope full|read]', file=sys.stderr)
+            print(f'uso: auth.py add "<nombre>" [--scope {"|".join(SCOPES)}]', file=sys.stderr)
             return 1
         scope = 'full'
         if '--scope' in argv:
