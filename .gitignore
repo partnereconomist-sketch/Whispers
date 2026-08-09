@@ -77,3 +77,6 @@ __pycache__/
 
 # Claves de API: se guarda el hash, pero el archivo no se versiona igual
 .auth/
+
+# Arranque local del equipo: ruta real del volumen. No se versiona.
+arrancar.local.*
