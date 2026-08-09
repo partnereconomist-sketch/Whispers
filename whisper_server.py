@@ -548,7 +548,16 @@ def _leer_input(entrada, base: Path):
         destino = resolver_en_work_dir(entrada.get("ref"), "input.ref", base)
         if not destino.is_file():
             raise ContractError("input_not_found", f"input.ref no existe: {destino}")
-        datos, filename = destino.read_bytes(), destino.name
+        # input.filename MANDA sobre el nombre en disco, igual que en el
+        # Procesador (extractor.py: `inp.get('filename') or target.name`). El
+        # nombre del Raw está saneado para ser seguro en cualquier sistema de
+        # archivos —sin tildes ni espacios— pero el que el usuario mandó es el
+        # que tiene que aparecer en la salida y en el encabezado del markdown.
+        # Pisarlo hacía que una misma carpeta entregada mezclara dos convenciones:
+        # '7_Evaluación_financiera.md' de los PDF junto a
+        # 'Dise_o_y_evaluacion.md' de la media, sin que nada explicara por qué.
+        datos = destino.read_bytes()
+        filename = entrada.get("filename") or destino.name
     else:
         raise ContractError("unsupported_input_kind",
                             f"input.kind '{kind}' no soportado (usá 'inline' o 'path')")
@@ -619,7 +628,23 @@ def _a_wav(origen: Path) -> tuple[Path, bool]:
     r = subprocess.run([FFMPEG, "-y", "-i", str(origen), "-ar", "16000", "-ac", "1",
                         "-c:a", "pcm_s16le", str(destino)], capture_output=True, text=True)
     if r.returncode != 0 or not destino.is_file():
-        raise RuntimeError(f"ffmpeg falló ({r.returncode}): {r.stderr[-500:]}")
+        err = r.stderr or ""
+        # El archivo INCOMPLETO merece su propio código y su propio consejo. Un
+        # MP4/M4A guarda el índice (el átomo `moov`) y sin él ffmpeg no puede
+        # abrirlo aunque la cabecera `ftyp` esté perfecta -- que es justo lo que
+        # engaña: el archivo se ve válido por el principio y por la extensión.
+        # Caso real (2026-08-08): 'Primera sesion.m4a', 8.300.000 bytes exactos,
+        # ftyp M4A correcto, sin moov. Es una copia o descarga cortada, no un
+        # problema del transcriptor, y decir "ffmpeg falló" manda a revisar el
+        # lugar equivocado. `retryable` en False: reintentar no lo va a arreglar.
+        if "moov atom not found" in err:
+            raise ContractError(
+                "media_incompleto",
+                f"'{origen.name}' está incompleto: tiene cabecera de audio/video válida pero le "
+                f"falta el índice (átomo 'moov'), que en MP4/M4A va al final. Es el resultado "
+                f"típico de una copia o descarga cortada, o de una grabación que no cerró bien. "
+                f"El archivo hay que volver a obtenerlo; reintentar la transcripción no cambia nada.")
+        raise RuntimeError(f"ffmpeg falló ({r.returncode}): {err[-500:]}")
     return destino, True
 
 
