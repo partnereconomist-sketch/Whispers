@@ -31,6 +31,7 @@ USO
   python whisper_server.py           # escucha en :8091 (WHISPER_PORT)
   curl 127.0.0.1:8091/health
 """
+import hashlib
 import json
 import os
 import re
@@ -201,7 +202,7 @@ FLAGS = {
 
 # params que acepta el contrato = las EXPUESTAS + las propias de este servicio
 CAMPOS_PARAMS = ({nombre for tipo, nombre, _ in FLAGS.values() if tipo == EXPUESTA}
-                 | {"segment_seconds"})
+                 | {"segment_seconds", "tramo_seconds"})
 
 MEDIOS = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".opus", ".aac", ".wma",
           ".mp4", ".mkv", ".avi", ".mov", ".webm", ".mpeg", ".mpg", ".m4v"}
@@ -347,6 +348,16 @@ def _validar_params(params: dict) -> dict:
             "fallo silencioso conocido: no se puede distinguir un video mal detectado de "
             "uno traducido a propósito. Indicá el idioma de ORIGEN explícitamente.")
 
+    # Tamaño de cada invocación independiente de whisper-cli. 0 = archivo entero
+    # (comportamiento de siempre). No se elige un default distinto de 0 hasta
+    # medir cuánto cuesta en calidad cortar el contexto entre tramos.
+    tramo = params.get("tramo_seconds", 0)
+    _exigir_tipo(tramo, int, "params.tramo_seconds", "un entero")
+    if tramo and not (30 <= tramo <= 3600):
+        raise ContractError("out_of_range",
+                            f"params.tramo_seconds debe ser 0 (sin fraccionar) o estar entre 30 y "
+                            f"3600; llegó {tramo}. El piso de 30 s no es arbitrario: whisper "
+                            f"procesa en ventanas de 30 s y por debajo el recorte no se aplica.")
     seg = params.get("segment_seconds", 120)
     _exigir_tipo(seg, int, "params.segment_seconds", "un entero")
     if not (10 <= seg <= 1800):
@@ -378,7 +389,7 @@ def _validar_params(params: dict) -> dict:
 
     resuelto = {
         "language": idioma, "model": modelo, "model_path": disponibles[modelo],
-        "translate": traducir, "segment_seconds": seg,
+        "translate": traducir, "segment_seconds": seg, "tramo_seconds": tramo,
         "temperature": numero("temperature", 0.0, 0.0, 1.0),
         "threads": entero("threads", max(1, (os.cpu_count() or 4) // 2), 1, 64),
         "best_of": entero("best_of", 5, 1, 20),
@@ -697,6 +708,117 @@ def _a_markdown(segmentos, filename, params, meta_extra) -> str:
     return "\n".join(partes)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# FRACCIONAMIENTO REANUDABLE
+#
+# Hasta ahora este servicio transcribia el archivo entero en UNA invocacion: si
+# moria en el minuto 20 de 22, se perdian los 20. Es la unica pieza larga del
+# flujo sin fraccionar, y la ironica: las flags que hacen falta —`offset_ms` y
+# `duration_ms`— ya estaban expuestas y su propia tabla las documenta como
+# "permite reintentar SOLO el tramo que fallo, en vez de todo el archivo".
+# Estaban construidas y no las usaba nadie.
+#
+# El shard se guarda con clave de CONTENIDO (audio + parametros + limites del
+# tramo), no de posicion, asi que reanudar y reprocesar un archivo cambiado usan
+# el mismo mecanismo. Escritura atomica; un shard ilegible cuenta como pendiente.
+#
+# NO es gratis y por eso es configurable: whisper mantiene contexto de texto
+# entre segmentos (`-mc -1`), y cortar en tramos lo pierde en cada frontera. Es
+# el mismo intercambio que `--group-bytes` en el grafo, donde aislar de mas
+# midio -22% de nodos. Hay que medirlo antes de elegir el default.
+# ══════════════════════════════════════════════════════════════════════════════
+
+BYTES_POR_SEGUNDO = 16000 * 2      # el WAV que produce _a_wav: 16 kHz, mono, 16 bits
+
+
+def _duracion_wav(wav: Path) -> float:
+    """Segundos de audio, sacados del tamaño del WAV.
+
+    Sin ffprobe ni dependencias nuevas: _a_wav garantiza 16 kHz mono 16 bits, así
+    que la duración es aritmética sobre el tamaño. Menos una cosa que puede
+    faltar en un equipo.
+    """
+    try:
+        return max(0.0, (wav.stat().st_size - 44) / BYTES_POR_SEGUNDO)
+    except OSError:
+        return 0.0
+
+
+def _tramos(dur_s: float, tramo_s: int) -> list[tuple[int, int]]:
+    """[(offset_ms, duration_ms)] en que se parte el audio.
+
+    Devuelve un solo tramo entero cuando no hay que fraccionar, para que el
+    camino de siempre no cambie de forma: mismo comando, mismo resultado.
+
+    El límite inferior de 30 s no es arbitrario: whisper procesa en ventanas de
+    30 s, así que pedir menos devuelve la ventana completa igual y el recorte no
+    se aplica (medido en este repo el 2026-08-05).
+    """
+    if tramo_s <= 0 or dur_s <= tramo_s or tramo_s < 30:
+        return [(0, 0)]
+    tramos, t = [], 0
+    while t < dur_s:
+        tramos.append((int(t * 1000), int(min(tramo_s, dur_s - t) * 1000) + 1000))
+        t += tramo_s
+    return tramos
+
+
+def _sin_solape(previos: list, nuevos: list) -> list:
+    """Descarta del tramo nuevo lo que el anterior ya transcribió.
+
+    A cada tramo se le pide un segundo de más para que ninguna palabra caiga
+    justo en el corte. Sin deduplicar, ese solape aparece DOS VECES en la salida:
+    medido, el tramo 1 terminaba con "Dicha carpeta va a ser el directorio de
+    trabajo..." y el tramo 2 empezaba con exactamente lo mismo. Un texto repetido
+    no es sólo ruido -- para el grafo son dos afirmaciones donde había una.
+
+    Se conserva la del tramo ANTERIOR y se descarta la del nuevo: la primera se
+    transcribió con el contexto de todo lo que venía antes, la segunda arranca en
+    frío. Ante lo mismo dicho dos veces, gana la que tuvo más contexto.
+
+    SE DESCARTA POR EL FIN, NO POR EL INICIO, y la diferencia costó 19 palabras.
+    La primera versión tiraba todo segmento que EMPEZARA antes del fin anterior,
+    y eso se llevó uno que empezaba en 360 s pero llegaba hasta 367: solapaba un
+    segundo y aportaba seis, así que se perdió una oración entera ("...con una
+    opción preliminar de una estructura de cómo se va a desarrollar"). Ahora sólo
+    cae el segmento que ya está ENTERAMENTE cubierto.
+
+    Queda un solape chico posible en el que sí se conserva. Es deliberado: repetir
+    un segundo de audio es un costo acotado y visible, perder una oración es un
+    hueco que nadie nota.
+    """
+    if not previos or not nuevos:
+        return nuevos
+    hasta = previos[-1][1]              # fin del último segmento ya aceptado
+    return [s for s in nuevos if s[1] > hasta]
+
+
+def _clave_tramo(datos: bytes, params: dict, off: int, dur: int) -> str:
+    h = hashlib.sha256()
+    h.update(datos)
+    h.update(json.dumps({k: v for k, v in sorted(params.items())
+                         if k not in ("offset_ms", "duration_ms")}).encode())
+    h.update(f"{off}:{dur}".encode())
+    return h.hexdigest()[:16]
+
+
+def _shard_leer(base: Path, clave: str):
+    p = base / "trabajo" / "whisper" / f"{clave}.json"
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+        return [tuple(x) for x in d["segmentos"]]
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError):
+        return None       # ilegible o a medio escribir = PENDIENTE, nunca hecho
+
+
+def _shard_guardar(base: Path, clave: str, segmentos) -> None:
+    p = base / "trabajo" / "whisper" / f"{clave}.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.parcial")
+    tmp.write_text(json.dumps({"segmentos": segmentos}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(p)
+
+
 def execute_job(parsed: dict) -> dict:
     job_id, params = parsed["job_id"], parsed["params"]
     t0 = time.perf_counter()
@@ -716,30 +838,64 @@ def execute_job(parsed: dict) -> dict:
         if temporal:
             borrar.append(wav)
 
-        cmd = construir_comando(params, wav)
+        # Un tramo entero cuando no hay que fraccionar: mismo comando de siempre.
+        tramos = _tramos(_duracion_wav(wav), params.get("tramo_seconds", 0))
+        base = parsed.get("base")
+        segmentos, reusados = [], 0
 
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace")
-        if r.returncode != 0:
-            # Un fallo con stderr VACIO no es lo mismo que uno con mensaje: significa
-            # que el proceso murió sin llegar a quejarse (aborto nativo, falta de
-            # memoria, DLL). Visto real el 2026-08-05: exit 0xc0e90002 sin una sola
-            # línea, y el MISMO comando funcionó al reintentar. Decirlo es lo que
-            # permite a quien llama distinguir "reintentá" de "esto no va a andar".
-            detalle = (r.stderr or "").strip()
-            if not detalle:
-                detalle = (f"whisper-cli murió sin escribir nada en stderr (exit "
-                           f"{r.returncode} = {r.returncode & 0xFFFFFFFF:#x}). Suele ser un aborto "
-                           f"nativo por recursos, no un error de argumentos: el mismo comando "
-                           f"puede funcionar al reintentar. Comando: {' '.join(cmd)}")
-            return _envelope(job_id, "error",
-                             meta={"op": "transcribe", "elapsed_s": round(time.perf_counter() - t0, 2),
-                                   "retryable": not (r.stderr or "").strip()},
-                             error={"code": "whisper_failed",
-                                    "message": f"whisper-cli salió con {r.returncode}",
-                                    "detail": detalle[-1200:]})
+        for off, dur in tramos:
+            clave = _clave_tramo(parsed["datos"], params, off, dur) if base else None
+            if clave:
+                previo = _shard_leer(base, clave)
+                if previo is not None:
+                    # La MISMA deduplicación que el camino fresco. Sin esto un job
+                    # reanudado devolvía una salida distinta —y peor, con el solape
+                    # repetido— que uno corrido de una sola vez. Reanudar tiene que
+                    # dar el mismo resultado, o la reanudabilidad cambia la respuesta.
+                    segmentos += _sin_solape(segmentos, previo)
+                    reusados += 1
+                    continue
 
-        segmentos = _segmentos(r.stdout)
+            p_tramo = dict(params)
+            if len(tramos) > 1:
+                p_tramo["offset_ms"], p_tramo["duration_ms"] = off, dur
+            cmd = construir_comando(p_tramo, wav)
+
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               encoding="utf-8", errors="replace")
+            if r.returncode != 0:
+                # Un fallo con stderr VACIO no es lo mismo que uno con mensaje: significa
+                # que el proceso murió sin llegar a quejarse (aborto nativo, falta de
+                # memoria, DLL). Visto real el 2026-08-05: exit 0xc0e90002 sin una sola
+                # línea, y el MISMO comando funcionó al reintentar. Decirlo es lo que
+                # permite a quien llama distinguir "reintentá" de "esto no va a andar".
+                detalle = (r.stderr or "").strip()
+                if not detalle:
+                    detalle = (f"whisper-cli murió sin escribir nada en stderr (exit "
+                               f"{r.returncode} = {r.returncode & 0xFFFFFFFF:#x}). Suele ser un aborto "
+                               f"nativo por recursos, no un error de argumentos: el mismo comando "
+                               f"puede funcionar al reintentar. Comando: {' '.join(cmd)}")
+                hechos = len(tramos) - (len(tramos) - tramos.index((off, dur)))
+                return _envelope(job_id, "error",
+                                 meta={"op": "transcribe",
+                                       "elapsed_s": round(time.perf_counter() - t0, 2),
+                                       "retryable": not (r.stderr or "").strip(),
+                                       # Lo ya hecho quedó guardado: reenviar el mismo
+                                       # job retoma desde acá, no desde cero.
+                                       "tramos": len(tramos), "tramos_hechos": hechos},
+                                 error={"code": "whisper_failed",
+                                        "message": (f"whisper-cli salió con {r.returncode} en el tramo "
+                                                    f"{tramos.index((off, dur)) + 1}/{len(tramos)}"),
+                                        "detail": detalle[-1200:]})
+
+            del_tramo = _segmentos(r.stdout)
+            # El shard se escribe DESPUES de que el tramo salió bien: un corte
+            # antes o durante deja el shard inexistente o intacto, nunca a medias.
+            # Se guarda SIN deduplicar, con lo que whisper devolvió: el shard es
+            # el resultado del tramo, y el solape es un problema del ensamblado.
+            if clave:
+                _shard_guardar(base, clave, del_tramo)
+            segmentos += _sin_solape(segmentos, del_tramo)
         md = _a_markdown(segmentos, parsed["filename"], params, {})
         meta = {"op": "transcribe", "elapsed_s": round(time.perf_counter() - t0, 2),
                 "language": params["language"], "model": params["model"],
@@ -747,6 +903,9 @@ def execute_job(parsed: dict) -> dict:
                 # [1] = fin del último segmento. Con [0] (su inicio) un audio de 11 s
                 # con un solo segmento reportaba duración 0.
                 "duration_s": segmentos[-1][1] if segmentos else 0,
+                # Sin esto no hay forma de saber si fraccionó: la primera medición
+                # comparó "entero contra entero" sin que nada lo delatara.
+                "tramos": len(tramos), "tramos_reusados": reusados,
                 "chars": len(md)}
         avisos = []
         if not segmentos:
