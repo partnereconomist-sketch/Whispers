@@ -79,7 +79,7 @@ IDIOMAS = frozenset("""auto es en pt fr de it nl ru zh ja ko ar hi tr pl uk sv
     da fi no cs el he hu ro th vi id ms ca eu gl""".split())
 
 CAMPOS_ENVELOPE = {"contract", "job_id", "session_id", "tool", "op", "input", "output", "params",
-                   "on_behalf_of"}
+                   "on_behalf_of", "async"}
 CAMPOS_INPUT = {"kind", "filename", "content_base64", "ref"}
 CAMPOS_OUTPUT = {"kind", "dir"}
 
@@ -994,6 +994,184 @@ def _escribir_salida(md: str, parsed: dict) -> dict:
 # Servidor
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Mitad asíncrona del contrato
+#
+# POR QUE LLEGA ULTIMA, Y POR QUE IGUAL HABIA QUE HACERLA. El Procesador y
+# Synapse aceptan `{"async": true}` desde el 2026-08-04; este servidor no, y el
+# asignador lo trataba como excepción con un `SOPORTA_ASYNC = {...}` que lo
+# dejaba afuera. Funcionaba -- el LOTE es asíncrono, así que quien sostenía la
+# conexión larga era un hilo del asignador y no el usuario. Pero la asimetría se
+# paga en cada consumidor nuevo, que tiene que saber que uno de los cuatro
+# programas es distinto. Lo señaló la rutina evaluativa del 2026-08-07.
+#
+# Y es el que MAS lo necesita: es el job más largo del flujo (627 s un video de
+# 22 min), o sea el que más tiempo pasa con una conexión HTTP abierta esperando.
+#
+# ENCOLAR NO AUMENTA EL PARALELISMO. El worker corre bajo el MISMO semáforo que
+# el camino síncrono: con MAX_CONCURRENT=1 los jobs se procesan de a uno, en
+# orden. Lo único que cambia es que el cliente no tiene que sostener la conexión.
+# ══════════════════════════════════════════════════════════════════════════════
+
+ASYNC_TTL_S = max(60, int(os.environ.get("WHISPER_ASYNC_TTL_S", "3600")))
+ASYNC_MAX_JOBS = max(16, int(os.environ.get("WHISPER_ASYNC_MAX_JOBS", "512")))
+_async_jobs = {}
+_async_lock = threading.Lock()
+
+
+def _estado_dir() -> Path:
+    d = Path(WORK_DIR) / "_jobs" / TOOL_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _estado_guardar(job_id: str, reg: dict) -> None:
+    """El registro en DISCO existe para una sola pregunta: si el servidor se
+    reinicia con un job en vuelo, ¿qué le contesta al que venga a consultarlo?
+
+    Sin esto la respuesta sería `job_desconocido`, que manda a revisar el lugar
+    equivocado -- el job existió y su trabajo se perdió, que es algo muy
+    distinto de un id inventado. Whisper es justamente el job más largo, así que
+    es el más probable de estar corriendo cuando algo se cae."""
+    try:
+        p = _estado_dir() / f"{_segmento_seguro(job_id, 'sin-id')}.json"
+        tmp = p.with_suffix(".json.parcial")
+        tmp.write_text(json.dumps(reg, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(p)
+    except OSError:
+        pass          # el disco no puede tumbar un job que por lo demás va bien
+
+
+def _estado_reconciliar() -> int:
+    """Al arrancar: todo lo que quedó `queued`/`running` en disco murió con el
+    proceso anterior. Se marca como interrumpido para que el poll diga la verdad
+    en vez de inventar un desconocido."""
+    tocados = 0
+    try:
+        archivos = list(_estado_dir().glob("*.json"))
+    except OSError:
+        return 0
+    for p in archivos:
+        try:
+            reg = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if reg.get("estado") in ("queued", "running"):
+            reg["estado"] = "error"
+            reg["interrumpido"] = True
+            reg["finished_at"] = time.time()
+            _estado_guardar(reg.get("job_id"), reg)
+            tocados += 1
+    return tocados
+
+
+def _async_purgar(ahora=None) -> None:
+    """Descarta resultados TERMINADOS que nadie vino a buscar. Nunca toca los
+    encolados ni los corriendo. Se llama al registrar y al consultar, así que no
+    hace falta un hilo de limpieza."""
+    ahora = ahora or time.time()
+    with _async_lock:
+        for jid in [j for j, v in _async_jobs.items()
+                    if v["finished_at"] and (ahora - v["finished_at"]) > ASYNC_TTL_S]:
+            _async_jobs.pop(jid, None)
+        if len(_async_jobs) > ASYNC_MAX_JOBS:
+            terminados = sorted(((j, v) for j, v in _async_jobs.items() if v["finished_at"]),
+                                key=lambda kv: kv[1]["finished_at"])
+            for jid, _ in terminados[: len(_async_jobs) - ASYNC_MAX_JOBS]:
+                _async_jobs.pop(jid, None)
+
+
+def encolar(parsed: dict) -> dict:
+    """Registra el job, lanza su hilo y devuelve el envelope de aceptación."""
+    job_id = parsed["job_id"]
+    _async_purgar()
+    with _async_lock:
+        vivo = _async_jobs.get(job_id)
+        if vivo and vivo["finished_at"] is None:
+            raise ContractError(
+                "job_already_running",
+                f"job_id '{job_id}' ya está encolado o corriendo; usá otro o consultá "
+                f"GET /jobs/{job_id}")
+        _async_jobs[job_id] = {"status": "queued", "submitted_at": time.time(),
+                               "started_at": None, "finished_at": None, "result": None}
+    registro = {"job_id": job_id, "estado": "queued", "session_id": parsed.get("session_id"),
+                "submitted_at": _async_jobs[job_id]["submitted_at"],
+                "started_at": None, "finished_at": None}
+    _estado_guardar(job_id, registro)
+
+    def _worker():
+        global _in_flight
+        try:
+            # El semáforo se toma ACA dentro, no antes: hasta que le toque el
+            # turno el job sigue en `queued`, que es la verdad que ve quien
+            # consulta. Marcarlo `running` al encolar sería mentir sobre la cola.
+            with _semaforo:
+                with _async_lock:
+                    j = _async_jobs.get(job_id)
+                    if j:
+                        j["status"], j["started_at"] = "running", time.time()
+                registro.update(estado="running", started_at=time.time())
+                _estado_guardar(job_id, registro)
+                with _in_flight_lock:
+                    _in_flight += 1
+                try:
+                    resultado = execute_job(parsed)
+                finally:
+                    with _in_flight_lock:
+                        _in_flight -= 1
+        except Exception as e:
+            resultado = _envelope(job_id, "error", error={
+                "code": "internal_error", "message": str(e), "detail": traceback.format_exc()})
+        with _async_lock:
+            j = _async_jobs.get(job_id)
+            if j:
+                j.update(result=resultado, status=resultado.get("status", "error"),
+                         finished_at=time.time())
+        registro.update(estado=resultado.get("status", "error"), finished_at=time.time())
+        _estado_guardar(job_id, registro)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return _envelope(job_id, "queued", meta={"poll": f"GET /jobs/{job_id}"})
+
+
+def consultar(job_id: str) -> tuple[dict, int]:
+    """(envelope, código). `queued`/`running` devuelven 200 con el estado."""
+    _async_purgar()
+    with _async_lock:
+        j = _async_jobs.get(job_id)
+        if j and j["finished_at"] and j["result"]:
+            return j["result"], 200
+        if j:
+            espera = round(time.time() - j["submitted_at"], 1)
+            return _envelope(job_id, j["status"],
+                             meta={"esperando_s": espera, "en_cola": _en_cola()}), 200
+
+    # No está en memoria: puede ser un id inventado, un resultado vencido, o un
+    # job que el reinicio se llevó puesto. Las tres respuestas son distintas.
+    try:
+        p = _estado_dir() / f"{_segmento_seguro(job_id, 'sin-id')}.json"
+        reg = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
+    except (OSError, json.JSONDecodeError):
+        reg = None
+    if reg and reg.get("interrumpido"):
+        return _envelope(job_id, "error", error={
+            "code": "job_interrumpido",
+            "message": "El servidor se reinició mientras este job estaba en curso; su trabajo se "
+                       "perdió. Reenvialo — no es un id desconocido ni un resultado vencido. Los "
+                       "tramos ya transcritos se reusan, así que no arranca de cero.",
+            "detail": f"estado previo: {reg.get('estado')}"}), 200
+    if reg:
+        return _envelope(job_id, "error", error={
+            "code": "result_expired",
+            "message": f"El job terminó pero su resultado ya se descartó (TTL {ASYNC_TTL_S}s)."}), 410
+    return _envelope(job_id, "error", error={
+        "code": "job_desconocido", "message": f"No hay ningún job con id '{job_id}'"}), 404
+
+
+def _en_cola() -> int:
+    return sum(1 for v in _async_jobs.values() if v["status"] == "queued")
+
+
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
@@ -1013,7 +1191,12 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        if urlparse(self.path).path == "/health":
+        ruta = urlparse(self.path).path
+        if ruta.startswith("/jobs/"):
+            env, code = consultar(ruta[len("/jobs/"):])
+            self.send_json(env, code)
+            return
+        if ruta == "/health":
             with _in_flight_lock:
                 vuelo = _in_flight
             self.send_json({
@@ -1025,6 +1208,11 @@ class Handler(BaseHTTPRequestHandler):
                 "whisper_cli": WHISPER_CLI, "ffmpeg": FFMPEG,
                 "models": sorted(modelos_disponibles()),
                 "languages": sorted(IDIOMAS),
+                "async": {"supported": True,
+                          "submit": 'POST /jobs con {"async": true} -> 202',
+                          "poll": "GET /jobs/<job_id>",
+                          "result_ttl_s": ASYNC_TTL_S,
+                          "en_cola": _en_cola()},
                 "params": sorted(CAMPOS_PARAMS),
                 # Se publica para que quien despacha pueda PEDIR el modo auto
                 # sabiendo que existe, en vez de mandar -1 a ciegas contra un
@@ -1105,6 +1293,12 @@ class Handler(BaseHTTPRequestHandler):
             job_id = envelope.get("job_id") if isinstance(envelope, dict) else None
 
             parsed = parse_job(envelope, cliente)
+            if envelope.get("async"):
+                # 202 recién DESPUES de validar: si validara adentro del hilo,
+                # un envelope malo devolvería 202 y el error aparecería en el
+                # poll, que es el peor lugar para enterarse de un typo.
+                self.send_json(encolar(parsed), 202)
+                return
             global _in_flight
             with _semaforo:
                 with _in_flight_lock:
@@ -1130,7 +1324,11 @@ if __name__ == "__main__":
     print(f"  whisper-cli: {WHISPER_CLI or 'NO ENCONTRADO — compilar whisper.cpp'}")
     print(f"  ffmpeg:      {FFMPEG or 'NO ENCONTRADO — solo se podrán procesar .wav 16kHz'}")
     print(f"  Modelos:     {', '.join(sorted(modelos)) or 'NINGUNO en ' + str(MODELS_DIR)}")
-    print(f"  Endpoints:   GET /health   POST /jobs")
+    _rotos = _estado_reconciliar()
+    if _rotos:
+        print(f"  AVISO: {_rotos} job(s) quedaron en curso en el arranque anterior; "
+              f"marcados como interrumpidos")
+    print(f"  Endpoints:   GET /health   POST /jobs   GET /jobs/<id>")
     print(f"  Concurrencia: {MAX_CONCURRENT}")
     print(f"  params.language es OBLIGATORIO (la autodetección puede traducir en silencio)\n")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
