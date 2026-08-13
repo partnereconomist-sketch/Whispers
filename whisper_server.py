@@ -353,11 +353,12 @@ def _validar_params(params: dict) -> dict:
     # medir cuánto cuesta en calidad cortar el contexto entre tramos.
     tramo = params.get("tramo_seconds", 0)
     _exigir_tipo(tramo, int, "params.tramo_seconds", "un entero")
-    if tramo and not (30 <= tramo <= 3600):
+    if tramo not in (0, AUTO) and not (30 <= tramo <= 3600):
         raise ContractError("out_of_range",
-                            f"params.tramo_seconds debe ser 0 (sin fraccionar) o estar entre 30 y "
-                            f"3600; llegó {tramo}. El piso de 30 s no es arbitrario: whisper "
-                            f"procesa en ventanas de 30 s y por debajo el recorte no se aplica.")
+                            f"params.tramo_seconds debe ser 0 (sin fraccionar), {AUTO} (que decida "
+                            f"el servidor segun la duracion) o estar entre 30 y 3600; llego "
+                            f"{tramo}. El piso de 30 s no es arbitrario: whisper procesa en "
+                            f"ventanas de 30 s y por debajo el recorte no se aplica.")
     seg = params.get("segment_seconds", 120)
     _exigir_tipo(seg, int, "params.segment_seconds", "un entero")
     if not (10 <= seg <= 1800):
@@ -730,6 +731,12 @@ def _a_markdown(segmentos, filename, params, meta_extra) -> str:
 
 BYTES_POR_SEGUNDO = 16000 * 2      # el WAV que produce _a_wav: 16 kHz, mono, 16 bits
 
+# `tramo_seconds = -1` -> que el servidor decida por duracion (ver _tramo_auto).
+# -1 y no 0: 0 ya significa "archivo entero" y son decisiones distintas.
+AUTO = -1
+AUTO_MIN_S = int(os.environ.get("WHISPER_AUTO_TRAMO_MIN_S", "900"))
+AUTO_TRAMO_S = int(os.environ.get("WHISPER_AUTO_TRAMO_S", "300"))
+
 
 def _duracion_wav(wav: Path) -> float:
     """Segundos de audio, sacados del tamaño del WAV.
@@ -742,6 +749,31 @@ def _duracion_wav(wav: Path) -> float:
         return max(0.0, (wav.stat().st_size - 44) / BYTES_POR_SEGUNDO)
     except OSError:
         return 0.0
+
+
+def _tramo_auto(dur_s: float) -> int:
+    """Con `tramo_seconds = -1`, cuánto partir según lo que dura el audio.
+
+    POR QUE ACA Y NO EN EL ASIGNADOR. La decisión de política es del que
+    despacha, pero el DATO —cuánto dura— sólo este servidor lo tiene barato:
+    `_duracion_wav` es aritmética sobre el WAV ya convertido. Para saberlo antes,
+    el asignador tendría que parsear el moov atom de un mp4 o cargar ffprobe en
+    su contenedor. Así que el asignador pide `-1` (la política: "fraccioná si
+    conviene") y acá se aplica con el hecho a la vista. Mismo reparto que `vad`,
+    donde el asignador pregunta la capacidad en vez de suponerla.
+
+    EL UMBRAL SALE DE UNA MEDICION Y DE UN JUICIO, y conviene decir cuál es cuál.
+    Medido sobre 8 min de audio: fraccionar en 3 tramos costó +10% de tiempo
+    (219,8 s -> 241,1 s) y 93,8% de palabras en común, casi todo formato más tres
+    términos de dominio. Eso es lo que se PAGA. Lo que se COMPRA es no repetir
+    todo cuando el proceso muere, y eso vale en proporción a lo que dura.
+
+    El corte en 15 min es un juicio anclado en ese único dato, no una medición:
+    por debajo, rehacer entero cuesta menos que el 6% de deriva; por encima
+    (el video de 22 min son 627 s de proceso) deja de serlo. Se puede mover con
+    WHISPER_AUTO_TRAMO_MIN_S sin tocar código, justamente porque es un juicio.
+    """
+    return AUTO_TRAMO_S if dur_s > AUTO_MIN_S else 0
 
 
 def _tramos(dur_s: float, tramo_s: int) -> list[tuple[int, int]]:
@@ -839,7 +871,10 @@ def execute_job(parsed: dict) -> dict:
             borrar.append(wav)
 
         # Un tramo entero cuando no hay que fraccionar: mismo comando de siempre.
-        tramos = _tramos(_duracion_wav(wav), params.get("tramo_seconds", 0))
+        dur = _duracion_wav(wav)
+        pedido = params.get("tramo_seconds", 0)
+        tramo_s = _tramo_auto(dur) if pedido == AUTO else pedido
+        tramos = _tramos(dur, tramo_s)
         base = parsed.get("base")
         segmentos, reusados = [], 0
 
@@ -991,6 +1026,11 @@ class Handler(BaseHTTPRequestHandler):
                 "models": sorted(modelos_disponibles()),
                 "languages": sorted(IDIOMAS),
                 "params": sorted(CAMPOS_PARAMS),
+                # Se publica para que quien despacha pueda PEDIR el modo auto
+                # sabiendo que existe, en vez de mandar -1 a ciegas contra un
+                # servidor viejo que lo rechazaria por out_of_range.
+                "tramo_auto": {"valor": AUTO, "desde_s": AUTO_MIN_S,
+                               "tramo_s": AUTO_TRAMO_S},
                 # /health ABIERTO a propósito: un orquestador tiene que poder
                 # preguntar si hace falta credencial ANTES de mandar una.
                 "auth": {
