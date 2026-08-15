@@ -600,7 +600,13 @@ def parse_job(envelope: dict, cliente=None) -> dict:
     if op != "transcribe":
         raise ContractError("unsupported_op", f"op '{op}' desconocida (este servicio solo hace 'transcribe')")
 
-    for campo, tipo, esperado in (("job_id", str, "una cadena"), ("session_id", str, "una cadena"),
+    # `async` SE VALIDA POR TIPO. Sin esto, {"async": "false"} -- una cadena, que
+    # es el error de serializacion tipico entre lenguajes -- se evaluaba por
+    # truthiness de Python: "false" no esta vacia, asi que el job se encolaba
+    # como asincrono aunque el cliente hubiera pedido sincrono, y sin avisar. El
+    # Procesador ya lo rechazaba con 400; era una divergencia del contrato.
+    for campo, tipo, esperado in (("async", bool, 'true o false, no la cadena "true"'),
+                                  ("job_id", str, "una cadena"), ("session_id", str, "una cadena"),
                                   ("on_behalf_of", str, "una cadena")):
         if envelope.get(campo) is not None:
             _exigir_tipo(envelope[campo], tipo, campo, esperado)
@@ -1046,7 +1052,7 @@ def _estado_reconciliar() -> int:
     """Al arrancar: todo lo que quedó `queued`/`running` en disco murió con el
     proceso anterior. Se marca como interrumpido para que el poll diga la verdad
     en vez de inventar un desconocido."""
-    tocados = 0
+    tocados = barridos = 0
     try:
         archivos = list(_estado_dir().glob("*.json"))
     except OSError:
@@ -1062,6 +1068,20 @@ def _estado_reconciliar() -> int:
             reg["finished_at"] = time.time()
             _estado_guardar(reg.get("job_id"), reg)
             tocados += 1
+            continue
+        # BARRIDO. Sin esto cada job asincrono dejaba un .json permanente: una
+        # fuga de archivos de estado sin cota en un servidor de larga vida. Se
+        # borra lo TERMINADO y vencido, nunca lo que quedo en curso -- eso
+        # acaba de marcarse `interrumpido` y su respuesta le sirve a alguien.
+        fin = reg.get("finished_at")
+        if fin and (time.time() - fin) > ASYNC_TTL_S:
+            try:
+                p.unlink()
+                barridos += 1
+            except OSError:
+                pass
+    if barridos:
+        print(f"  {barridos} registro(s) de job vencidos borrados del disco", file=sys.stderr)
     return tocados
 
 
@@ -1127,7 +1147,15 @@ def encolar(parsed: dict) -> dict:
             if j:
                 j.update(result=resultado, status=resultado.get("status", "error"),
                          finished_at=time.time())
-        registro.update(estado=resultado.get("status", "error"), finished_at=time.time())
+        # EL ENVELOPE COMPLETO VA A DISCO, no solo el estado. Sin esto, un job
+        # que TERMINO BIEN antes de un reinicio se perdia entero y el poll
+        # respondia `result_expired` -- un mensaje falso, porque no habia vencido
+        # ningun TTL: nunca se habia escrito. Whisper es el job mas largo del
+        # flujo (627 s un video de 22 min), o sea el que mas probablemente
+        # termine mientras el cliente todavia no lo consulto. El Procesador ya
+        # lo hacia asi; esto era una divergencia, no una decision.
+        registro.update(estado=resultado.get("status", "error"),
+                        finished_at=time.time(), envelope=resultado)
         _estado_guardar(job_id, registro)
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -1153,6 +1181,10 @@ def consultar(job_id: str) -> tuple[dict, int]:
         reg = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else None
     except (OSError, json.JSONDecodeError):
         reg = None
+    if reg and reg.get("envelope"):
+        # Terminado antes de un reinicio: se devuelve el trabajo ya hecho en vez
+        # de mentir con un TTL que no vencio.
+        return reg["envelope"], 200
     if reg and reg.get("interrumpido"):
         return _envelope(job_id, "error", error={
             "code": "job_interrumpido",
