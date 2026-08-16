@@ -527,6 +527,16 @@ def resolver_en_work_dir(ref: str, campo: str, base: Path) -> Path:
     igual. Lo encontró la rutina evaluativa nocturna del 2026-08-07.
 
     `resolve()` va ANTES de comparar, para que '..' y symlinks queden resueltos.
+
+    EL CODIGO DE ERROR ES `path_outside_workdir`, sin guion bajo entre work y dir.
+    Hasta el 2026-08-15 este servidor decia `path_outside_work_dir` mientras el
+    Procesador, el asignador y Synapse decian `path_outside_workdir`. La guarda
+    funcionaba igual en los cuatro -- lo que divergia era el NOMBRE del fallo, que
+    es justamente lo que un cliente usa para clasificar. No habia roto nada porque
+    hoy nadie ramifica sobre este codigo (el asignador solo lo emite), pero ese es
+    el mismo fallo que ya costo un job sano reportado como error: el contrato fija
+    el vocabulario, y una palabra que solo conoce un programa obliga al cliente a
+    conocer las dos formas o a leer la desconocida como otra cosa.
     """
     if not ref:
         raise ContractError("missing_fields", f"{campo} es obligatorio")
@@ -535,7 +545,7 @@ def resolver_en_work_dir(ref: str, campo: str, base: Path) -> Path:
         destino = base / destino
     destino = destino.resolve()
     if destino != base and base not in destino.parents:
-        raise ContractError("path_outside_work_dir",
+        raise ContractError("path_outside_workdir",
                             f"{campo} debe estar dentro de {base} (su usuario y sesión); "
                             f"recibido: {ref}")
     return destino
