@@ -278,6 +278,50 @@ FFMPEG = _buscar_ffmpeg()
 # avisar en una prueba real de este proyecto.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def dispositivo() -> dict:
+    """En que dispositivo puede correr la transcripcion, leido del BUILD.
+
+    POR QUE SE PUBLICA (bloque transversal del PLAN). El dia que haya una GPU la
+    pregunta «¿la esta usando?» tiene que contestarse mirando, no midiendo a
+    ciegas — y este proyecto ya supuso tres veces en que corria algo y se
+    equivoco las tres (D-024).
+
+    COMO SE AVERIGUA, y por que asi. whisper.cpp NO publica su system_info en
+    `--help`: solo lo imprime cuando ya esta transcribiendo, asi que preguntarselo
+    costaria una corrida. Pero carga sus backends como bibliotecas con nombre
+    fijo (`ggml-cuda`, `ggml-vulkan`, `ggml-metal`, `ggml-blas`), asi que las que
+    estan JUNTO al binario son evidencia directa de con que se compilo. Si solo
+    esta `ggml-cpu`, una GPU en la maquina no cambia nada hasta recompilar.
+
+    Si el binario no aparece, se dice `desconocido` con el motivo. No se adivina
+    a partir de que la maquina tenga o no una GPU: que exista no dice que este
+    compilada la ruta para usarla, y confundir las dos cosas seria inventar
+    justamente el dato que esto viene a dar (D-003).
+    """
+    ACELERADOS = ("cuda", "vulkan", "metal", "hip", "sycl", "blas", "openvino", "cann")
+    if not WHISPER_CLI:
+        return {"device": "desconocido", "podria_usar_gpu": None, "backends": [],
+                "nota": "no se encontro whisper-cli; sin binario no hay build que mirar"}
+    carpeta = Path(WHISPER_CLI).parent
+    try:
+        libs = [p.stem for p in carpeta.iterdir()
+                if p.suffix.lower() in (".dll", ".so", ".dylib") and p.stem.startswith("ggml")]
+    except OSError as e:
+        return {"device": "desconocido", "podria_usar_gpu": None, "backends": [],
+                "nota": f"no se pudo listar {carpeta}: {e}"}
+    backends = sorted(l.replace("ggml-", "") for l in libs if l != "ggml")
+    acelerados = [b for b in backends if any(a in b for a in ACELERADOS)]
+    return {
+        "device": "cuda" if any("cuda" in b for b in acelerados) else "cpu",
+        "podria_usar_gpu": bool(acelerados),
+        "backends": backends,
+        "binario": WHISPER_CLI,
+        "nota": ("este build solo trae el backend de CPU: una GPU en la maquina no cambiaria "
+                 "nada hasta recompilar whisper.cpp con soporte (ver D-060)")
+               if not acelerados else f"backends acelerados presentes: {acelerados}",
+    }
+
+
 class ContractError(Exception):
     def __init__(self, code, message, detail=None):
         super().__init__(message)
@@ -1244,6 +1288,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({
                 "status": "ok", "contract": CONTRACT_VERSION, "tool": TOOL_NAME,
                 "ops": ["transcribe"], "work_dir": WORK_DIR,
+                "dispositivo": dispositivo(),
                 # Publicado para que quien despacha decida `vad` CHEQUEANDO en
                 # vez de suponer: sin modelo, --vad muere a mitad del trabajo.
                 "vad": {"disponible": bool(modelo_vad()), "modelo": modelo_vad()},
